@@ -1,0 +1,5 @@
+name = "extract-flag"
+description = "Extract CTF-style flag patterns from text files"
+command = "python3"
+args = ["./examples/plugins/extract_flag.py"]
+categories = ["misc", "forensics", "reverse"]

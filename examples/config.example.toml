@@ -1,0 +1,50 @@
+[general]
+default_json_output = false
+log_level = "info"
+
+[safety]
+allowed_paths = ["."]
+allowed_hosts = ["127.0.0.1", "localhost"]
+allowed_ports = [80, 443, 8000, 8080, 1337]
+offline_only = false
+research_web_enabled = true
+require_confirmation_for_network = true
+require_confirmation_for_exec = true
+require_confirmation_for_install = true
+max_runtime_per_action_secs = 120
+max_parallel_actions = 2
+redact_secrets_in_logs = true
+
+[providers]
+fallback_local = true
+request_timeout_secs = 45
+retries = 2
+backoff_base_ms = 500
+max_input_tokens = 24000
+
+[providers.openai]
+enabled = false
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+api_key = ""
+default_model = "gpt-4.1-mini"
+
+[model_routing.reasoning]
+provider = "local"
+model = ""
+
+[model_routing.coding]
+provider = "local"
+model = ""
+
+[model_routing.summarization]
+provider = "local"
+model = ""
+
+[model_routing.vision]
+provider = "local"
+model = ""
+
+[model_routing.classification]
+provider = "local"
+model = ""
