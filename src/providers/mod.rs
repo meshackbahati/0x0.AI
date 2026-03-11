@@ -1,5 +1,6 @@
 mod anthropic;
 mod gemini;
+mod generic;
 mod local;
 mod openai_compat;
 
@@ -69,7 +70,8 @@ impl ProviderManager {
         let local = local::LocalProvider::new();
         providers.insert(local.name().to_string(), Box::new(local));
 
-        if let Some(p) = openai_compat::OpenAiCompatProvider::from_named("openai", &config.providers.openai)
+        if let Some(p) =
+            openai_compat::OpenAiCompatProvider::from_named("openai", &config.providers.openai)
         {
             providers.insert("openai".to_string(), Box::new(p));
         }
@@ -79,20 +81,20 @@ impl ProviderManager {
         ) {
             providers.insert("openrouter".to_string(), Box::new(p));
         }
-        if let Some(p) = openai_compat::OpenAiCompatProvider::from_named(
-            "together",
-            &config.providers.together,
-        ) {
+        if let Some(p) =
+            openai_compat::OpenAiCompatProvider::from_named("together", &config.providers.together)
+        {
             providers.insert("together".to_string(), Box::new(p));
         }
-        if let Some(p) = openai_compat::OpenAiCompatProvider::from_named(
-            "moonshot",
-            &config.providers.moonshot,
-        ) {
+        if let Some(p) =
+            openai_compat::OpenAiCompatProvider::from_named("moonshot", &config.providers.moonshot)
+        {
             providers.insert("moonshot".to_string(), Box::new(p));
         }
 
-        if let Some(p) = anthropic::AnthropicProviderClient::from_config(&config.providers.anthropic) {
+        if let Some(p) =
+            anthropic::AnthropicProviderClient::from_config(&config.providers.anthropic)
+        {
             providers.insert("anthropic".to_string(), Box::new(p));
         }
 
@@ -108,6 +110,12 @@ impl ProviderManager {
 
         for cfg in &config.providers.custom_openai_compatible {
             if let Some(p) = openai_compat::OpenAiCompatProvider::from_custom(cfg) {
+                providers.insert(cfg.name.clone(), Box::new(p));
+            }
+        }
+
+        for cfg in &config.providers.generic_http {
+            if let Some(p) = generic::GenericHttpProviderClient::from_config(cfg) {
                 providers.insert(cfg.name.clone(), Box::new(p));
             }
         }
@@ -168,6 +176,10 @@ impl ProviderManager {
             )
         }
 
+        if stream.is_some() {
+            return provider.generate(&request, stream);
+        }
+
         let retries = self.config.providers.retries;
         let mut last_err: Option<anyhow::Error> = None;
 
@@ -181,7 +193,7 @@ impl ProviderManager {
                 }
             }
         }
-        match provider.generate(&request, stream) {
+        match provider.generate(&request, None) {
             Ok(resp) => Ok(resp),
             Err(err) => Err(last_err.unwrap_or(err)),
         }

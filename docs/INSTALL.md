@@ -46,6 +46,32 @@ Installer behavior:
 - deletes the temporary clone automatically
 - optional: keep source via `--keep-source`
 
+## Update
+
+CLI updater:
+
+```bash
+ox update
+```
+
+Commit-first updater:
+
+```bash
+ox update --prefer-commit
+```
+
+Preview target only:
+
+```bash
+ox update --dry-run
+```
+
+Script updater (direct):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/meshackbahati/0x0.AI/main/scripts/update.sh | bash
+```
+
 ## Initialize
 
 ```bash
@@ -70,4 +96,7 @@ Non-interactive:
 
 ```bash
 0x0 setup --non-interactive --provider openai --api-key-env OPENAI_API_KEY --model gpt-4.1-mini
+0x0 setup --non-interactive --provider gemini --api-key-env GEMINI_API_KEY --model gemini-1.5-flash
 ```
+
+For complete command/parameter coverage, see [Command Reference](COMMANDS.md).

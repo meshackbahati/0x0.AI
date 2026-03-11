@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
+use std::io::{BufRead, BufReader};
 
 use crate::config::GeminiProvider;
 use crate::util::{chunk_text, estimate_tokens};
@@ -86,16 +87,28 @@ impl Provider for GeminiProviderClient {
             .clone()
             .unwrap_or_else(|| self.default_model.clone());
 
-        let endpoint = format!(
-            "{}/models/{}:generateContent?key={}",
-            self.base_url, model, self.api_key
-        );
-
         let prompt = if let Some(system) = &req.system {
             format!("System:\n{}\n\nUser:\n{}", system, req.prompt)
         } else {
             req.prompt.clone()
         };
+
+        if let Some(sink) = stream.as_mut()
+            && let Ok(text) = self.generate_streaming(req, &model, &prompt, *sink)
+        {
+            return Ok(ProviderResponse {
+                provider: "gemini".to_string(),
+                model,
+                prompt_tokens_est: estimate_tokens(&req.prompt),
+                completion_tokens_est: estimate_tokens(&text),
+                text,
+            });
+        }
+
+        let endpoint = format!(
+            "{}/models/{}:generateContent?key={}",
+            self.base_url, model, self.api_key
+        );
 
         let body = json!({
             "contents": [
@@ -138,6 +151,80 @@ impl Provider for GeminiProviderClient {
             completion_tokens_est: estimate_tokens(&text),
             text,
         })
+    }
+}
+
+impl GeminiProviderClient {
+    fn generate_streaming(
+        &self,
+        req: &ProviderRequest,
+        model: &str,
+        prompt: &str,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let endpoint = format!(
+            "{}/models/{}:streamGenerateContent?alt=sse&key={}",
+            self.base_url, model, self.api_key
+        );
+
+        let body = json!({
+            "contents": [
+                { "parts": [ { "text": prompt } ] }
+            ],
+            "generationConfig": {
+                "temperature": req.temperature,
+                "maxOutputTokens": req.max_tokens
+            }
+        });
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(req.timeout_secs))
+            .build()
+            .context("building gemini client")?;
+
+        let response = client
+            .post(endpoint)
+            .json(&body)
+            .send()
+            .context("sending gemini streaming request")?;
+
+        if !response.status().is_success() {
+            bail!(
+                "gemini streaming returned HTTP {}",
+                response.status().as_u16()
+            );
+        }
+
+        let mut reader = BufReader::new(response);
+        let mut line = String::new();
+        let mut text = String::new();
+
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).context("reading stream line")?;
+            if n == 0 {
+                break;
+            }
+            let trimmed = line.trim();
+            if !trimmed.starts_with("data:") {
+                continue;
+            }
+            let data = trimmed.trim_start_matches("data:").trim();
+            if data.is_empty() {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(data)
+                && let Ok(chunk) = extract_text(&value)
+            {
+                sink(&chunk);
+                text.push_str(&chunk);
+            }
+        }
+
+        if text.trim().is_empty() {
+            bail!("stream returned empty text");
+        }
+        Ok(text)
     }
 }
 

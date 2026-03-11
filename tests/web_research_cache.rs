@@ -12,9 +12,9 @@ fn fetch_url_is_cached() {
 
     let _mock_page = server.mock(|when, then| {
         when.method(GET).path("/");
-        then.status(200)
-            .header("content-type", "text/html")
-            .body("<html><head><title>Fixture</title></head><body><p>Hello test cache</p></body></html>");
+        then.status(200).header("content-type", "text/html").body(
+            "<html><head><title>Fixture</title></head><body><p>Hello test cache</p></body></html>",
+        );
     });
 
     let _mock_robots = server.mock(|when, then| {

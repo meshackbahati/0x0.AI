@@ -10,9 +10,9 @@ pub mod policy;
 pub mod providers;
 pub mod report;
 pub mod research;
+pub mod storage;
 pub mod tools;
 pub mod util;
-pub mod storage;
 pub mod web_lab;
 
 pub use app::run;

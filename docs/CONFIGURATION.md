@@ -13,6 +13,8 @@ View/edit:
 0x0 config edit
 ```
 
+Full command/flag coverage is documented in [Command Reference](COMMANDS.md).
+
 ## Provider Configuration Methods
 
 1. Env vars only
@@ -23,8 +25,10 @@ Examples:
 
 ```bash
 0x0 providers configure openai --enable --api-key-env OPENAI_API_KEY --model gpt-4.1-mini
+0x0 providers configure gemini --enable --api-key-env GEMINI_API_KEY --model gemini-1.5-flash
 0x0 providers models --provider openai
 0x0 providers use --task reasoning --provider openai --model gpt-4.1
+0x0 providers test --provider gemini
 ```
 
 Custom endpoints:

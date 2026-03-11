@@ -54,18 +54,14 @@ impl PolicyEngine {
 
     pub fn ensure_exec_allowed(&self, approvals: Approvals, program: &str) -> Result<()> {
         if self.cfg.require_confirmation_for_exec && !approvals.exec {
-            bail!(
-                "execution blocked for {program}; pass explicit approval (--approve-exec/--yes)"
-            )
+            bail!("execution blocked for {program}; pass explicit approval (--approve-exec/--yes)")
         }
         Ok(())
     }
 
     pub fn ensure_install_allowed(&self, approvals: Approvals, tool: &str) -> Result<()> {
         if self.cfg.require_confirmation_for_install && !approvals.install {
-            bail!(
-                "install blocked for {tool}; pass explicit approval (--approve-install/--yes)"
-            )
+            bail!("install blocked for {tool}; pass explicit approval (--approve-install/--yes)")
         }
         Ok(())
     }

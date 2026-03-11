@@ -92,6 +92,22 @@ pub struct StateStats {
     pub web_cache: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub status: String,
+    pub root_path: String,
+    pub category: Option<String>,
+    pub summary: Option<String>,
+    pub action_count: i64,
+    pub artifact_count: i64,
+    pub hypothesis_count: i64,
+    pub note_count: i64,
+    pub citation_count: i64,
+}
+
 pub struct StateStore {
     conn: Connection,
     max_actions_per_session: usize,
@@ -106,7 +122,8 @@ impl StateStore {
         max_artifacts_per_session: usize,
         max_cache_entries: usize,
     ) -> Result<Self> {
-        let conn = Connection::open(path).with_context(|| format!("opening sqlite db {}", path.display()))?;
+        let conn = Connection::open(path)
+            .with_context(|| format!("opening sqlite db {}", path.display()))?;
         let store = Self {
             conn,
             max_actions_per_session,
@@ -270,6 +287,80 @@ impl StateStore {
                 summary: row.get(6)?,
             })
         })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_session_summaries(
+        &self,
+        limit: usize,
+        status: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<Vec<SessionSummary>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT
+                s.id,
+                s.created_at,
+                s.updated_at,
+                s.status,
+                s.root_path,
+                s.category,
+                s.summary,
+                COALESCE(a.count, 0) AS action_count,
+                COALESCE(ar.count, 0) AS artifact_count,
+                COALESCE(h.count, 0) AS hypothesis_count,
+                COALESCE(n.count, 0) AS note_count,
+                COALESCE(c.count, 0) AS citation_count
+            FROM sessions s
+            LEFT JOIN (
+                SELECT session_id, COUNT(*) AS count
+                FROM actions
+                GROUP BY session_id
+            ) a ON a.session_id = s.id
+            LEFT JOIN (
+                SELECT session_id, COUNT(*) AS count
+                FROM artifacts
+                GROUP BY session_id
+            ) ar ON ar.session_id = s.id
+            LEFT JOIN (
+                SELECT session_id, COUNT(*) AS count
+                FROM hypotheses
+                GROUP BY session_id
+            ) h ON h.session_id = s.id
+            LEFT JOIN (
+                SELECT session_id, COUNT(*) AS count
+                FROM notes
+                GROUP BY session_id
+            ) n ON n.session_id = s.id
+            LEFT JOIN (
+                SELECT session_id, COUNT(*) AS count
+                FROM citations
+                GROUP BY session_id
+            ) c ON c.session_id = s.id
+            WHERE (?1 IS NULL OR s.status = ?1)
+              AND (?2 IS NULL OR s.category = ?2)
+            ORDER BY s.updated_at DESC
+            LIMIT ?3
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![status, category, limit as i64], |row| {
+            Ok(SessionSummary {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                updated_at: row.get(2)?,
+                status: row.get(3)?,
+                root_path: row.get(4)?,
+                category: row.get(5)?,
+                summary: row.get(6)?,
+                action_count: row.get(7)?,
+                artifact_count: row.get(8)?,
+                hypothesis_count: row.get(9)?,
+                note_count: row.get(10)?,
+                citation_count: row.get(11)?,
+            })
+        })?;
+
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -670,7 +761,10 @@ mod tests {
         let store = StateStore::open(&db, 100, 100, 100).expect("store");
         store.create_session("abc", "/tmp/x").expect("session");
 
-        let session = store.get_session("abc").expect("session query").expect("exists");
+        let session = store
+            .get_session("abc")
+            .expect("session query")
+            .expect("exists");
         assert_eq!(session.id, "abc");
     }
 }

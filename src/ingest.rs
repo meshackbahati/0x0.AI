@@ -133,8 +133,8 @@ pub fn classify_file(path: &Path) -> (String, Option<String>) {
         "json" => "json",
         "yaml" | "yml" => "yaml",
         "csv" | "tsv" => "csv",
-        "c" | "cc" | "cpp" | "h" | "hpp" | "rs" | "py" | "js" | "ts" | "go" | "java"
-        | "php" | "rb" | "sh" => "source",
+        "c" | "cc" | "cpp" | "h" | "hpp" | "rs" | "py" | "js" | "ts" | "go" | "java" | "php"
+        | "rb" | "sh" => "source",
         "zip" | "tar" | "gz" | "xz" | "7z" | "rar" => "archive",
         "pcap" | "pcapng" => "pcap",
         "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" => "image",
@@ -152,16 +152,18 @@ pub fn classify_file(path: &Path) -> (String, Option<String>) {
     }
     .to_string();
 
-    let mime = Some(match kind.as_str() {
-        "text" | "source" | "json" | "yaml" | "csv" => "text/plain",
-        "archive" => "application/octet-stream",
-        "pcap" => "application/vnd.tcpdump.pcap",
-        "image" => "image/*",
-        "audio" => "audio/*",
-        "pdf" => "application/pdf",
-        _ => "application/octet-stream",
-    }
-    .to_string());
+    let mime = Some(
+        match kind.as_str() {
+            "text" | "source" | "json" | "yaml" | "csv" => "text/plain",
+            "archive" => "application/octet-stream",
+            "pcap" => "application/vnd.tcpdump.pcap",
+            "image" => "image/*",
+            "audio" => "audio/*",
+            "pdf" => "application/pdf",
+            _ => "application/octet-stream",
+        }
+        .to_string(),
+    );
 
     (kind, mime)
 }

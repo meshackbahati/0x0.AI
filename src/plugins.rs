@@ -38,7 +38,9 @@ impl PluginManager {
 
         let mut plugins = Vec::new();
 
-        for entry in fs::read_dir(&self.dir).with_context(|| format!("reading {}", self.dir.display()))? {
+        for entry in
+            fs::read_dir(&self.dir).with_context(|| format!("reading {}", self.dir.display()))?
+        {
             let entry = entry?;
             let path = entry.path();
             if !path.is_file() {

@@ -5,11 +5,14 @@ pub fn plan() -> CategoryPlan {
         category: ChallengeCategory::Reverse,
         hypotheses: vec![
             HypothesisTemplate {
-                text: "Target likely hides flag transformation logic in function graph branches.".to_string(),
+                text: "Target likely hides flag transformation logic in function graph branches."
+                    .to_string(),
                 confidence: 0.57,
             },
             HypothesisTemplate {
-                text: "String and import analysis can quickly expose algorithm families or API clues.".to_string(),
+                text:
+                    "String and import analysis can quickly expose algorithm families or API clues."
+                        .to_string(),
                 confidence: 0.63,
             },
         ],

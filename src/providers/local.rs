@@ -75,6 +75,46 @@ fn summarize_prompt(prompt: &str) -> String {
 
 fn classify_prompt(prompt: &str) -> String {
     let p = prompt.to_ascii_lowercase();
+    if p.contains("apk") || p.contains("dex") || p.contains("android") || p.contains("frida") {
+        return "Likely category: mobile (heuristic).".to_string();
+    }
+    if p.contains("solidity")
+        || p.contains("smart contract")
+        || p.contains("evm")
+        || p.contains("ethereum")
+    {
+        return "Likely category: blockchain (heuristic).".to_string();
+    }
+    if p.contains("terraform")
+        || p.contains("kubernetes")
+        || p.contains("iam")
+        || p.contains("cloud")
+    {
+        return "Likely category: cloud (heuristic).".to_string();
+    }
+    if p.contains("pcap") || p.contains("tshark") || p.contains("tcpdump") || p.contains("packet") {
+        return "Likely category: network (heuristic).".to_string();
+    }
+    if p.contains("llm")
+        || p.contains("model")
+        || p.contains("prompt injection")
+        || p.contains("tokenizer")
+    {
+        return "Likely category: ai (heuristic).".to_string();
+    }
+    if p.contains("firmware")
+        || p.contains("jtag")
+        || p.contains("uart")
+        || p.contains("microcontroller")
+    {
+        return "Likely category: hardware (heuristic).".to_string();
+    }
+    if p.contains("stego") || p.contains("lsb") || p.contains("exif") {
+        return "Likely category: stego (heuristic).".to_string();
+    }
+    if p.contains("osint") || p.contains("whois") || p.contains("dns") || p.contains("username") {
+        return "Likely category: osint (heuristic).".to_string();
+    }
     if p.contains("rsa") || p.contains("cipher") || p.contains("modulus") {
         return "Likely category: crypto (heuristic).".to_string();
     }

@@ -78,11 +78,7 @@ pub fn normalize_host(input: &str) -> Option<String> {
         return url.host_str().map(|h| h.to_ascii_lowercase());
     }
     let input = input.trim().to_ascii_lowercase();
-    if input.is_empty() {
-        None
-    } else {
-        Some(input)
-    }
+    if input.is_empty() { None } else { Some(input) }
 }
 
 pub fn estimate_tokens(s: &str) -> usize {

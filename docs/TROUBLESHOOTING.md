@@ -26,6 +26,7 @@
 
 ## Resume/State Issues
 
-- Inspect sessions via `0x0 stats`
+- Inspect sessions via `0x0 sessions --limit 20`
+- Check DB-level counters via `0x0 stats`
 - Replay actions: `0x0 replay <session-id>`
 - Keep DB path stable via your config location

@@ -38,7 +38,13 @@ pub fn build_writeup(store: &StateStore, session_id: &str) -> Result<WriteupBund
     md.push_str(&format!("- Updated: {}\n", session.updated_at));
     md.push_str(&format!("- Status: {}\n", session.status));
     md.push_str(&format!("- Root Path: `{}`\n", session.root_path));
-    md.push_str(&format!("- Category: `{}`\n", session.category.clone().unwrap_or_else(|| "unknown".to_string())));
+    md.push_str(&format!(
+        "- Category: `{}`\n",
+        session
+            .category
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
     if let Some(summary) = &session.summary {
         md.push_str(&format!("- Summary: {}\n", summary));
     }
@@ -59,17 +65,17 @@ pub fn build_writeup(store: &StateStore, session_id: &str) -> Result<WriteupBund
         md.push_str("- No hypotheses recorded\n\n");
     } else {
         for h in hypotheses {
-            md.push_str(&format!("- ({:.2}) [{}] {}\n", h.confidence, h.status, h.text));
+            md.push_str(&format!(
+                "- ({:.2}) [{}] {}\n",
+                h.confidence, h.status, h.text
+            ));
         }
         md.push('\n');
     }
 
     md.push_str("## Artifact Index\n");
     for a in artifacts.into_iter().take(100) {
-        md.push_str(&format!(
-            "- `{}` ({}, {} bytes)\n",
-            a.path, a.kind, a.size
-        ));
+        md.push_str(&format!("- `{}` ({}, {} bytes)\n", a.path, a.kind, a.size));
         if let Some(summary) = a.summary {
             md.push_str(&format!("  - summary: {}\n", summary));
         }
@@ -161,8 +167,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn extract_flags_from_actions(actions: &[ActionRecord]) -> Vec<String> {
-    let re = regex::Regex::new(r"(?i)([a-z0-9_\-]{2,16}\{[^\n\r\}]{1,180}\})")
-        .expect("flag regex");
+    let re = regex::Regex::new(r"(?i)([a-z0-9_\-]{2,16}\{[^\n\r\}]{1,180}\})").expect("flag regex");
 
     let mut out = BTreeSet::new();
     for a in actions {

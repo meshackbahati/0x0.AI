@@ -1,0 +1,5 @@
+name = "ctf-project"
+notes = "local investigation workspace"
+
+[safety]
+offline_only = false

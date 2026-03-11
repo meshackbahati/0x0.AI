@@ -2,9 +2,10 @@ use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
+use std::io::{BufRead, BufReader};
 
-use crate::config::OpenAiCompatProvider as OpenAiCompatProviderConfig;
 use crate::config::NamedOpenAiCompatProvider;
+use crate::config::OpenAiCompatProvider as OpenAiCompatProviderConfig;
 use crate::util::{chunk_text, estimate_tokens};
 
 use super::{Provider, ProviderRequest, ProviderResponse};
@@ -119,12 +120,24 @@ impl Provider for OpenAiCompatProvider {
         req: &ProviderRequest,
         mut stream: Option<&mut dyn FnMut(&str)>,
     ) -> Result<ProviderResponse> {
-        let endpoint = format!("{}/chat/completions", self.base_url);
         let model = req
             .model_override
             .clone()
             .unwrap_or_else(|| self.default_model.clone());
 
+        if let Some(sink) = stream.as_mut()
+            && let Ok(text) = self.generate_streaming(req, &model, *sink)
+        {
+            return Ok(ProviderResponse {
+                provider: self.name.clone(),
+                model,
+                prompt_tokens_est: estimate_tokens(&req.prompt),
+                completion_tokens_est: estimate_tokens(&text),
+                text,
+            });
+        }
+
+        let endpoint = format!("{}/chat/completions", self.base_url);
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
@@ -187,6 +200,99 @@ impl Provider for OpenAiCompatProvider {
     }
 }
 
+impl OpenAiCompatProvider {
+    fn generate_streaming(
+        &self,
+        req: &ProviderRequest,
+        model: &str,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let endpoint = format!("{}/chat/completions", self.base_url);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", self.api_key))
+                .context("building authorization header")?,
+        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(req.timeout_secs))
+            .build()
+            .context("building http client")?;
+
+        let mut messages = Vec::new();
+        if let Some(system) = &req.system {
+            messages.push(json!({"role": "system", "content": system}));
+        }
+        messages.push(json!({"role": "user", "content": req.prompt}));
+
+        let body = json!({
+            "model": model,
+            "messages": messages,
+            "temperature": req.temperature,
+            "max_tokens": req.max_tokens,
+            "stream": true
+        });
+
+        let response = client
+            .post(endpoint)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .context("sending streaming provider request")?;
+
+        if !response.status().is_success() {
+            bail!(
+                "provider {} streaming returned HTTP {}",
+                self.name,
+                response.status().as_u16()
+            );
+        }
+
+        let mut reader = BufReader::new(response);
+        let mut line = String::new();
+        let mut text = String::new();
+
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).context("reading stream line")?;
+            if n == 0 {
+                break;
+            }
+
+            let trimmed = line.trim();
+            if !trimmed.starts_with("data:") {
+                continue;
+            }
+            let data = trimmed.trim_start_matches("data:").trim();
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                break;
+            }
+
+            if let Ok(value) = serde_json::from_str::<Value>(data) {
+                if let Some(chunk) = extract_openai_stream_chunk(&value) {
+                    sink(&chunk);
+                    text.push_str(&chunk);
+                }
+                continue;
+            }
+
+            sink(data);
+            text.push_str(data);
+        }
+
+        if text.trim().is_empty() {
+            bail!("stream returned empty text");
+        }
+        Ok(text)
+    }
+}
+
 fn extract_text_from_openai_compat(value: &Value) -> Result<String> {
     let Some(choice) = value.get("choices").and_then(|c| c.get(0)) else {
         bail!("missing choices[0] in response")
@@ -215,6 +321,36 @@ fn extract_text_from_openai_compat(value: &Value) -> Result<String> {
     }
 
     bail!("could not extract text from response")
+}
+
+fn extract_openai_stream_chunk(value: &Value) -> Option<String> {
+    let choice = value.get("choices")?.get(0)?;
+
+    if let Some(content) = choice
+        .get("delta")
+        .and_then(|d| d.get("content"))
+        .and_then(Value::as_str)
+    {
+        return Some(content.to_string());
+    }
+
+    if let Some(text) = choice
+        .get("delta")
+        .and_then(|d| d.get("text"))
+        .and_then(Value::as_str)
+    {
+        return Some(text.to_string());
+    }
+
+    if let Some(content) = choice
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+    {
+        return Some(content.to_string());
+    }
+
+    None
 }
 
 #[cfg(test)]

@@ -257,12 +257,17 @@ fn write_payload_notebook(
     params: &BTreeSet<String>,
 ) -> Result<String> {
     fs::create_dir_all(out_dir)?;
-    let path = out_dir.join(format!("payload-notebook-{}.md", target.host.replace('.', "_")));
+    let path = out_dir.join(format!(
+        "payload-notebook-{}.md",
+        target.host.replace('.', "_")
+    ));
 
     let mut content = String::new();
     content.push_str("# Web Payload Notebook (Authorized Lab Use Only)\n\n");
     content.push_str(&format!("Target: `{}`\n\n", target.base_url));
-    content.push_str("Use this only for explicit CTF/lab targets you own or are authorized to test.\n\n");
+    content.push_str(
+        "Use this only for explicit CTF/lab targets you own or are authorized to test.\n\n",
+    );
 
     content.push_str("## Discovered Parameters\n");
     if params.is_empty() {

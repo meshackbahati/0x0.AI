@@ -12,6 +12,10 @@ args = ["/path/to/script.py"]
 categories = ["misc", "forensics"]
 ```
 
+Common category tags:
+- `crypto`, `pwn`, `rev`, `web`, `forensics`, `stego`, `osint`
+- `mobile`, `hardware`, `blockchain`, `cloud`, `network`, `ai`, `misc`
+
 Notes:
 - Plugins run through the safe subprocess wrapper.
 - Keep plugins local and auditable.

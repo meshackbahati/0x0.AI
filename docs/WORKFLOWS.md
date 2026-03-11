@@ -13,6 +13,7 @@
 
 ```bash
 0x0 solve-all ./ctf-archive --yes --max-challenges 30
+0x0 solve-all ../ --yes --max-challenges 80
 ```
 
 ## 3) Interactive Chat with Full Action Visibility
@@ -25,6 +26,7 @@ Inside chat:
 - `/research <query>`
 - `/run <local command>`
 - normal prompts to reason/code/explain
+- mention flag format naturally (example: `flag prefix is HTB`) so autonomous mode can prioritize matching candidates
 
 ## 4) Web Challenge (Authorized Lab)
 

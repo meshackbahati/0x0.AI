@@ -17,7 +17,11 @@ impl OutputMode {
     }
 }
 
-pub fn print_structured<T: Serialize>(mode: OutputMode, value: &T, text_fallback: &str) -> Result<()> {
+pub fn print_structured<T: Serialize>(
+    mode: OutputMode,
+    value: &T,
+    text_fallback: &str,
+) -> Result<()> {
     match mode {
         OutputMode::Text => {
             println!("{text_fallback}");

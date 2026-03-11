@@ -72,3 +72,4 @@ fi
 echo "[+] Installed successfully"
 echo "    Run: ox --help"
 echo "    Alias also available as: 0x0 --help"
+echo "    Update later with: ox update"

@@ -99,7 +99,12 @@ pub fn search_local(
                 let key = format!("{}:{}", path.display(), idx + 1);
                 if seen.insert(key) {
                     out.push(ResearchHit {
-                        title: Some(path.file_name().unwrap_or_default().to_string_lossy().to_string()),
+                        title: Some(
+                            path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string(),
+                        ),
                         snippet: snippet.clone(),
                         citation: Citation {
                             source_type: "file".to_string(),

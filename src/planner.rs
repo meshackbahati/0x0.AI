@@ -1,9 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 use crate::categories::{ChallengeCategory, plan_for};
 use crate::policy::{Approvals, PolicyEngine};
@@ -39,6 +41,13 @@ struct PlannedAction {
     port: Option<u16>,
 }
 
+#[derive(Debug, Clone)]
+struct GeneratedHelper {
+    name: String,
+    description: String,
+    path: PathBuf,
+}
+
 pub fn solve_loop(
     session_id: &str,
     target_path: &Path,
@@ -52,12 +61,31 @@ pub fn solve_loop(
     let plan = plan_for(category);
 
     for hypothesis in &plan.hypotheses {
-        store.add_hypothesis(
+        store.add_hypothesis(session_id, &hypothesis.text, hypothesis.confidence, "open")?;
+    }
+    if !plan.actions.is_empty() {
+        let theory = plan
+            .actions
+            .iter()
+            .map(|a| a.description.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let _ = store.add_note(session_id, &format!("theory-checklist: {theory}"));
+    }
+
+    let available_tools = log_tool_visibility(session_id, store, tools)?;
+    let generated_helpers = ensure_generated_helpers(target_path, category)
+        .with_context(|| format!("generating helper tools in {}", target_path.display()))?;
+    for helper in &generated_helpers {
+        let _ = store.add_note(
             session_id,
-            &hypothesis.text,
-            hypothesis.confidence,
-            "open",
-        )?;
+            &format!(
+                "generated-helper [{}]: {} ({})",
+                helper.name,
+                helper.path.display(),
+                helper.description
+            ),
+        );
     }
 
     let mut flags = HashSet::new();
@@ -65,7 +93,27 @@ pub fn solve_loop(
     let mut blocked = false;
     let mut fail_counts: HashMap<String, usize> = HashMap::new();
 
-    let actions = build_actions(category, target_path, options.max_steps);
+    let reserved_steps = generated_helpers.len().min(options.max_steps);
+    let mut actions = build_actions(
+        category,
+        target_path,
+        &available_tools,
+        options.max_steps.saturating_sub(reserved_steps),
+    );
+    for helper in generated_helpers.into_iter().rev() {
+        actions.insert(
+            0,
+            planned_owned(
+                "autotool",
+                "python3",
+                vec![
+                    helper.path.display().to_string(),
+                    target_path.display().to_string(),
+                    category.as_str().to_string(),
+                ],
+            ),
+        );
+    }
 
     for action in actions {
         if executed >= options.max_steps {
@@ -206,8 +254,13 @@ pub fn solve_loop(
         .join("\n");
 
     let summary_prompt = format!(
-        "Category: {}\nExecuted steps: {}\nCandidate flags: {:?}\nRecent actions:\n{}\n\nSummarize key findings and next deterministic steps.",
+        "Category: {}\nTheory cues: {}\nExecuted steps: {}\nCandidate flags: {:?}\nRecent actions:\n{}\n\nSummarize key findings and next deterministic steps.",
         category.as_str(),
+        plan.hypotheses
+            .iter()
+            .map(|h| h.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" | "),
         executed,
         flags,
         action_tail
@@ -242,60 +295,674 @@ pub fn solve_loop(
     })
 }
 
-fn build_actions(category: ChallengeCategory, target: &Path, max: usize) -> Vec<PlannedAction> {
-    let t = target.display().to_string();
+fn build_actions(
+    category: ChallengeCategory,
+    target: &Path,
+    available_tools: &HashSet<String>,
+    max: usize,
+) -> Vec<PlannedAction> {
     let mut actions = Vec::new();
+    let target_arg = target.display().to_string();
+    let discovered = discover_candidate_files(target, 300);
+    let text_targets = select_targets(&discovered, is_text_or_source, 8);
+    let code_targets = select_targets(&discovered, is_code_like, 8);
+    let bin_targets = select_targets(&discovered, is_binary_like, 6);
+    let image_targets = select_targets(&discovered, is_image_like, 6);
+    let pcap_targets = select_targets(&discovered, is_pcap_like, 4);
+    let mobile_targets = select_targets(&discovered, is_mobile_like, 4);
+    let contract_targets = select_targets(&discovered, is_contract_like, 6);
+    let infra_targets = select_targets(&discovered, is_infra_like, 6);
+    let ai_targets = select_targets(&discovered, is_ai_like, 6);
+
+    if has_tool(available_tools, "rg") {
+        push_action(
+            &mut actions,
+            "observe",
+            "rg",
+            vec![
+                "-n".to_string(),
+                "flag|ctf|secret|password|token".to_string(),
+                target_arg.clone(),
+            ],
+        );
+    }
+    for path in bin_targets.iter().take(2) {
+        push_if_tool(
+            &mut actions,
+            available_tools,
+            "triage",
+            "file",
+            vec![path.clone()],
+        );
+    }
 
     match category {
         ChallengeCategory::Crypto => {
-            actions.push(planned("triage", "rg", vec!["-n", "(n|e|c|p|q)", &t]));
-            actions.push(planned("triage", "file", vec![&t]));
+            for path in pick_nonempty(&text_targets, &code_targets).iter().take(3) {
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "triage",
+                    "rg",
+                    vec![
+                        "-n".to_string(),
+                        "(n|e|c|p|q|phi|mod)".to_string(),
+                        path.clone(),
+                    ],
+                );
+            }
         }
         ChallengeCategory::Pwn => {
-            actions.push(planned("triage", "file", vec![&t]));
-            actions.push(planned("triage", "checksec", vec!["--file", &t]));
-            actions.push(planned("triage", "readelf", vec!["-h", &t]));
-            actions.push(planned("extract", "strings", vec!["-n", "4", &t]));
+            for path in bin_targets.iter().take(2) {
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "triage",
+                    "checksec",
+                    vec!["--file".to_string(), path.clone()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "triage",
+                    "readelf",
+                    vec!["-h".to_string(), path.clone()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "extract",
+                    "strings",
+                    vec!["-n".to_string(), "4".to_string(), path.clone()],
+                );
+            }
         }
         ChallengeCategory::Reverse => {
-            actions.push(planned("triage", "file", vec![&t]));
-            actions.push(planned("extract", "strings", vec!["-n", "4", &t]));
-            actions.push(planned("triage", "objdump", vec!["-x", &t]));
+            for path in bin_targets.iter().take(2) {
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "extract",
+                    "strings",
+                    vec!["-n".to_string(), "4".to_string(), path.clone()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "triage",
+                    "objdump",
+                    vec!["-x".to_string(), path.clone()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "triage",
+                    "radare2",
+                    vec!["-A".to_string(), "-q".to_string(), path.clone()],
+                );
+            }
         }
-        ChallengeCategory::Forensics | ChallengeCategory::Stego => {
-            actions.push(planned("triage", "file", vec![&t]));
-            actions.push(planned("metadata", "exiftool", vec![&t]));
-            actions.push(planned("carve", "binwalk", vec![&t]));
+        ChallengeCategory::Forensics => {
+            for path in pick_nonempty(&pcap_targets, &bin_targets).iter().take(3) {
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "metadata",
+                    "exiftool",
+                    vec![path.clone()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "carve",
+                    "binwalk",
+                    vec![path.clone()],
+                );
+            }
+        }
+        ChallengeCategory::Stego => {
+            for path in image_targets.iter().take(3) {
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "metadata",
+                    "exiftool",
+                    vec![path.clone()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "extract",
+                    "zsteg",
+                    vec![path.clone()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "extract",
+                    "steghide",
+                    vec![
+                        "extract".to_string(),
+                        "-sf".to_string(),
+                        path.clone(),
+                        "-f".to_string(),
+                    ],
+                );
+            }
+        }
+        ChallengeCategory::Osint => {
+            for path in pick_nonempty(&text_targets, &code_targets).iter().take(3) {
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "triage",
+                    "rg",
+                    vec![
+                        "-n".to_string(),
+                        "@|https?://|dns|whois|twitter|discord|telegram".to_string(),
+                        path.clone(),
+                    ],
+                );
+            }
+        }
+        ChallengeCategory::Mobile => {
+            for path in mobile_targets.iter().take(2) {
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "extract",
+                    "strings",
+                    vec!["-n".to_string(), "4".to_string(), path.clone()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "decompile",
+                    "jadx",
+                    vec!["-d".to_string(), "jadx_out".to_string(), path.clone()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "decompile",
+                    "apktool",
+                    vec![
+                        "d".to_string(),
+                        path.clone(),
+                        "-o".to_string(),
+                        "apk_out".to_string(),
+                    ],
+                );
+            }
+        }
+        ChallengeCategory::Hardware => {
+            for path in pick_nonempty(&bin_targets, &text_targets).iter().take(3) {
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "carve",
+                    "binwalk",
+                    vec![path.clone()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "extract",
+                    "strings",
+                    vec!["-n".to_string(), "4".to_string(), path.clone()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "simulate",
+                    "iverilog",
+                    vec!["-g2012".to_string(), path.clone()],
+                );
+            }
+        }
+        ChallengeCategory::Blockchain => {
+            for path in pick_nonempty(&contract_targets, &code_targets)
+                .iter()
+                .take(3)
+            {
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "triage",
+                    "rg",
+                    vec![
+                        "-n".to_string(),
+                        "require|revert|delegatecall|tx.origin|selfdestruct".to_string(),
+                        path.clone(),
+                    ],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "compile",
+                    "solc",
+                    vec!["--ast-compact-json".to_string(), path.clone()],
+                );
+            }
+        }
+        ChallengeCategory::Cloud => {
+            for path in pick_nonempty(&infra_targets, &code_targets).iter().take(3) {
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "triage",
+                    "rg",
+                    vec![
+                        "-n".to_string(),
+                        "iam|policy|bucket|secret|token|kube|docker|terraform|role".to_string(),
+                        path.clone(),
+                    ],
+                );
+            }
+        }
+        ChallengeCategory::Network => {
+            for path in pcap_targets.iter().take(2) {
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "triage",
+                    "capinfos",
+                    vec![path.clone()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "triage",
+                    "tshark",
+                    vec!["-r".to_string(), path.clone(), "-q".to_string()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "triage",
+                    "tcpdump",
+                    vec![
+                        "-nr".to_string(),
+                        path.clone(),
+                        "-c".to_string(),
+                        "120".to_string(),
+                    ],
+                );
+            }
+        }
+        ChallengeCategory::Ai => {
+            for path in pick_nonempty(&ai_targets, &text_targets).iter().take(3) {
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "triage",
+                    "rg",
+                    vec![
+                        "-n".to_string(),
+                        "prompt|system|instruction|policy|secret|tool|jailbreak|model".to_string(),
+                        path.clone(),
+                    ],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "extract",
+                    "strings",
+                    vec!["-n".to_string(), "4".to_string(), path.clone()],
+                );
+            }
         }
         ChallengeCategory::Web => {
-            actions.push(PlannedAction {
-                action_type: "http-map".to_string(),
-                program: "curl".to_string(),
-                args: vec!["-i".to_string(), t],
-                requires_network: true,
-                host: extract_host(target),
-                port: extract_port(target),
-            });
+            if let Some(host) = extract_host(target) {
+                actions.push(PlannedAction {
+                    action_type: "http-map".to_string(),
+                    program: "curl".to_string(),
+                    args: vec!["-i".to_string(), target_arg.clone()],
+                    requires_network: true,
+                    host: Some(host),
+                    port: extract_port(target),
+                });
+            } else {
+                for path in pick_nonempty(&code_targets, &text_targets).iter().take(3) {
+                    push_if_tool(
+                        &mut actions,
+                        available_tools,
+                        "triage",
+                        "rg",
+                        vec![
+                            "-n".to_string(),
+                            "route|endpoint|token|cookie|auth|jwt|password".to_string(),
+                            path.clone(),
+                        ],
+                    );
+                }
+            }
         }
-        ChallengeCategory::Misc | ChallengeCategory::Osint | ChallengeCategory::Unknown => {
-            actions.push(planned("triage", "file", vec![&t]));
-            actions.push(planned("grep", "rg", vec!["-n", "flag|ctf|secret|password", &t]));
+        ChallengeCategory::Misc | ChallengeCategory::Unknown => {
+            for path in pick_nonempty(&text_targets, &bin_targets).iter().take(3) {
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "triage",
+                    "file",
+                    vec![path.clone()],
+                );
+                push_if_tool(
+                    &mut actions,
+                    available_tools,
+                    "extract",
+                    "strings",
+                    vec!["-n".to_string(), "4".to_string(), path.clone()],
+                );
+            }
         }
+    }
+
+    if actions.is_empty() {
+        push_action(&mut actions, "triage", "file", vec![target_arg]);
     }
 
     actions.truncate(max);
     actions
 }
 
-fn planned(action_type: &str, program: &str, args: Vec<&str>) -> PlannedAction {
+fn push_if_tool(
+    actions: &mut Vec<PlannedAction>,
+    available_tools: &HashSet<String>,
+    action_type: &str,
+    program: &str,
+    args: Vec<String>,
+) -> bool {
+    if !has_tool(available_tools, program) {
+        return false;
+    }
+    push_action(actions, action_type, program, args);
+    true
+}
+
+fn push_action(
+    actions: &mut Vec<PlannedAction>,
+    action_type: &str,
+    program: &str,
+    args: Vec<String>,
+) {
+    actions.push(planned_owned(action_type, program, args));
+}
+
+fn has_tool(available_tools: &HashSet<String>, program: &str) -> bool {
+    available_tools.contains(program)
+}
+
+fn discover_candidate_files(target: &Path, max_files: usize) -> Vec<PathBuf> {
+    if target.is_file() {
+        return vec![target.to_path_buf()];
+    }
+    if !target.is_dir() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for entry in WalkDir::new(target)
+        .max_depth(5)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        out.push(entry.path().to_path_buf());
+        if out.len() >= max_files {
+            break;
+        }
+    }
+    out
+}
+
+fn select_targets<F>(paths: &[PathBuf], mut pred: F, limit: usize) -> Vec<String>
+where
+    F: FnMut(&Path) -> bool,
+{
+    paths
+        .iter()
+        .filter(|p| pred(p))
+        .take(limit)
+        .map(|p| p.display().to_string())
+        .collect()
+}
+
+fn pick_nonempty(preferred: &[String], fallback: &[String]) -> Vec<String> {
+    if preferred.is_empty() {
+        fallback.to_vec()
+    } else {
+        preferred.to_vec()
+    }
+}
+
+fn ext(path: &Path) -> String {
+    path.extension()
+        .and_then(|x| x.to_str())
+        .map(|x| x.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn is_text_or_source(path: &Path) -> bool {
+    matches!(
+        ext(path).as_str(),
+        "txt"
+            | "md"
+            | "rst"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "csv"
+            | "tsv"
+            | "xml"
+            | "ini"
+            | "cfg"
+            | "toml"
+            | "log"
+            | "html"
+            | "js"
+            | "ts"
+            | "py"
+            | "rb"
+            | "php"
+            | "java"
+            | "go"
+            | "c"
+            | "cc"
+            | "cpp"
+            | "h"
+            | "hpp"
+            | "rs"
+            | "sql"
+            | "sh"
+    )
+}
+
+fn is_code_like(path: &Path) -> bool {
+    matches!(
+        ext(path).as_str(),
+        "js" | "ts"
+            | "py"
+            | "rb"
+            | "php"
+            | "java"
+            | "go"
+            | "c"
+            | "cc"
+            | "cpp"
+            | "h"
+            | "hpp"
+            | "rs"
+            | "sql"
+            | "sh"
+            | "sol"
+            | "vy"
+    )
+}
+
+fn is_binary_like(path: &Path) -> bool {
+    matches!(
+        ext(path).as_str(),
+        "elf" | "exe" | "dll" | "so" | "bin" | "out" | "class" | "apk"
+    )
+}
+
+fn is_image_like(path: &Path) -> bool {
+    matches!(
+        ext(path).as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp"
+    )
+}
+
+fn is_pcap_like(path: &Path) -> bool {
+    matches!(ext(path).as_str(), "pcap" | "pcapng")
+}
+
+fn is_mobile_like(path: &Path) -> bool {
+    matches!(ext(path).as_str(), "apk" | "ipa" | "dex" | "smali")
+}
+
+fn is_contract_like(path: &Path) -> bool {
+    matches!(ext(path).as_str(), "sol" | "vy")
+}
+
+fn is_infra_like(path: &Path) -> bool {
+    let e = ext(path);
+    matches!(e.as_str(), "tf" | "tfvars" | "yaml" | "yml" | "json")
+        || path
+            .file_name()
+            .and_then(|x| x.to_str())
+            .is_some_and(|name| {
+                let lower = name.to_ascii_lowercase();
+                lower == "dockerfile"
+                    || lower.contains("kube")
+                    || lower.contains("helm")
+                    || lower.contains("compose")
+            })
+}
+
+fn is_ai_like(path: &Path) -> bool {
+    matches!(
+        ext(path).as_str(),
+        "onnx" | "pt" | "pth" | "safetensors" | "json" | "txt" | "md"
+    ) || path
+        .file_name()
+        .and_then(|x| x.to_str())
+        .is_some_and(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.contains("tokenizer") || lower.contains("prompt") || lower.contains("model")
+        })
+}
+
+fn planned_owned(action_type: &str, program: &str, args: Vec<String>) -> PlannedAction {
     PlannedAction {
         action_type: action_type.to_string(),
         program: program.to_string(),
-        args: args.into_iter().map(ToString::to_string).collect(),
+        args,
         requires_network: false,
         host: None,
         port: None,
     }
+}
+
+fn log_tool_visibility(
+    session_id: &str,
+    store: &StateStore,
+    tools: &ToolManager,
+) -> Result<HashSet<String>> {
+    let statuses = tools.discover_default_tools();
+    let available = statuses
+        .iter()
+        .filter(|t| t.available)
+        .map(|t| t.name.clone())
+        .collect::<Vec<_>>();
+    let missing = statuses
+        .iter()
+        .filter(|t| !t.available)
+        .map(|t| t.name.clone())
+        .collect::<Vec<_>>();
+
+    let summary = format!(
+        "available({}): {}\nmissing({}): {}",
+        available.len(),
+        available.join(", "),
+        missing.len(),
+        missing.join(", ")
+    );
+    let metadata = json!({
+        "available_count": available.len(),
+        "missing_count": missing.len(),
+    });
+    store.add_action(NewAction {
+        session_id,
+        action_type: "tool-discovery",
+        command: "auto-discover-tools",
+        target: None,
+        status: "ok",
+        stdout: Some(&summary),
+        stderr: None,
+        metadata: Some(&metadata),
+    })?;
+    Ok(available.into_iter().collect())
+}
+
+fn ensure_generated_helpers(
+    target_path: &Path,
+    category: ChallengeCategory,
+) -> Result<Vec<GeneratedHelper>> {
+    let base_dir = if target_path.is_dir() {
+        target_path.to_path_buf()
+    } else {
+        target_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    let helper_dir = base_dir.join(".0x0-ai").join("generated-tools");
+    fs::create_dir_all(&helper_dir)?;
+
+    let mut out = Vec::new();
+    let probe = helper_dir.join("ctf_probe.py");
+    fs::write(&probe, PROBE_SCRIPT)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&probe)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&probe, perms)?;
+    }
+    out.push(GeneratedHelper {
+        name: "ctf-probe".to_string(),
+        description: "Behavior and artifact observation helper".to_string(),
+        path: probe,
+    });
+
+    if matches!(
+        category,
+        ChallengeCategory::Crypto
+            | ChallengeCategory::Blockchain
+            | ChallengeCategory::Ai
+            | ChallengeCategory::Misc
+    ) {
+        let extractor = helper_dir.join("pattern_probe.py");
+        fs::write(&extractor, PATTERN_SCRIPT)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&extractor)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&extractor, perms)?;
+        }
+        out.push(GeneratedHelper {
+            name: "pattern-probe".to_string(),
+            description: "Pattern and token extractor helper".to_string(),
+            path: extractor,
+        });
+    }
+
+    Ok(out)
 }
 
 fn extract_candidate_flags(text: &str) -> Vec<String> {
@@ -324,3 +991,109 @@ fn extract_port(target: &Path) -> Option<u16> {
     }
     None
 }
+
+const PROBE_SCRIPT: &str = r#"#!/usr/bin/env python3
+import os
+import stat
+import subprocess
+import sys
+from collections import Counter
+
+root = sys.argv[1] if len(sys.argv) > 1 else "."
+category = sys.argv[2] if len(sys.argv) > 2 else "unknown"
+
+if not os.path.exists(root):
+    print(f"[probe] missing target: {root}")
+    sys.exit(0)
+
+files = []
+if os.path.isfile(root):
+    files = [root]
+else:
+    for base, _, names in os.walk(root):
+        for name in names:
+            files.append(os.path.join(base, name))
+            if len(files) >= 250:
+                break
+        if len(files) >= 250:
+            break
+
+ext_counts = Counter()
+exec_targets = []
+for path in files:
+    ext = os.path.splitext(path)[1].lower() or "<none>"
+    ext_counts[ext] += 1
+    try:
+        st = os.stat(path)
+        if st.st_mode & stat.S_IXUSR:
+            exec_targets.append(path)
+    except OSError:
+        pass
+
+print(f"[probe] category={category} files={len(files)}")
+print("[probe] top extensions:")
+for ext, count in ext_counts.most_common(10):
+    print(f"  - {ext}: {count}")
+
+for path in exec_targets[:2]:
+    for args in ([], ["--help"], ["-h"]):
+        try:
+            proc = subprocess.run([path] + args, capture_output=True, text=True, timeout=2)
+            out = (proc.stdout or proc.stderr or "").strip().replace("\n", " ")
+            out = out[:180]
+            print(f"[behavior] {os.path.basename(path)} {' '.join(args) if args else '<no-args>'} => code={proc.returncode} out={out}")
+        except Exception as exc:
+            print(f"[behavior] {os.path.basename(path)} {' '.join(args) if args else '<no-args>'} => error={exc}")
+"#;
+
+const PATTERN_SCRIPT: &str = r#"#!/usr/bin/env python3
+import os
+import re
+import sys
+
+root = sys.argv[1] if len(sys.argv) > 1 else "."
+patterns = [
+    re.compile(r"(?i)[a-z0-9_-]{2,16}\{[^\n\r\}]{1,180}\}"),
+    re.compile(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?([^\s'\";]+)"),
+    re.compile(r"(?i)(flag|ctf|challenge)[^a-z0-9]{0,6}([a-z0-9_\-\{\}]{4,})"),
+]
+
+if not os.path.exists(root):
+    print(f"[pattern] missing target: {root}")
+    sys.exit(0)
+
+files = []
+if os.path.isfile(root):
+    files = [root]
+else:
+    for base, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(base, name)
+            if os.path.getsize(path) > 2_000_000:
+                continue
+            files.append(path)
+            if len(files) >= 200:
+                break
+        if len(files) >= 200:
+            break
+
+hits = 0
+for path in files:
+    try:
+        with open(path, "r", errors="ignore") as f:
+            text = f.read()
+    except OSError:
+        continue
+    for pat in patterns:
+        for m in pat.finditer(text):
+            print(f"[pattern-hit] {path}: {m.group(0)[:180]}")
+            hits += 1
+            if hits >= 40:
+                break
+        if hits >= 40:
+            break
+    if hits >= 40:
+        break
+
+print(f"[pattern] files={len(files)} hits={hits}")
+"#;

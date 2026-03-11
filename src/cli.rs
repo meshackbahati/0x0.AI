@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -8,7 +8,11 @@ pub enum OutputFormat {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "0x0", version, about = "0x0.AI - local-first autonomous CTF assistant")]
+#[command(
+    name = "0x0",
+    version,
+    about = "0x0.AI - local-first autonomous CTF assistant"
+)]
 pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
@@ -32,17 +36,19 @@ pub struct Cli {
     pub output: Option<OutputFormat>,
 
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     Init(InitArgs),
     Setup(SetupArgs),
+    Update(UpdateArgs),
     Scan(ScanArgs),
     Solve(SolveArgs),
     SolveAll(SolveAllArgs),
     Resume(ResumeArgs),
+    Sessions(SessionsArgs),
     Research(ResearchArgs),
     Chat(ChatArgs),
     Note(NoteArgs),
@@ -89,6 +95,27 @@ pub struct SetupArgs {
 
     #[arg(long, default_value_t = false)]
     pub non_interactive: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    #[arg(long, default_value_t = false)]
+    pub system: bool,
+
+    #[arg(long, default_value_t = false)]
+    pub user: bool,
+
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    #[arg(long)]
+    pub reference: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    pub prefer_commit: bool,
+
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -172,6 +199,18 @@ pub struct ResumeArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct SessionsArgs {
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+
+    #[arg(long)]
+    pub status: Option<String>,
+
+    #[arg(long)]
+    pub category: Option<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct ResearchArgs {
     pub query: String,
 
@@ -204,6 +243,13 @@ pub enum RouteTask {
 pub enum ProviderCompat {
     Openai,
     Anthropic,
+    Generic,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ChatApprovalMode {
+    All,
+    Risky,
 }
 
 #[derive(Debug, Args)]
@@ -220,6 +266,15 @@ pub struct ChatArgs {
     #[arg(long)]
     pub prompt: Option<String>,
 
+    #[arg(long, action = ArgAction::Set, default_value_t = true)]
+    pub autonomous: bool,
+
+    #[arg(long, value_enum, default_value_t = ChatApprovalMode::Risky)]
+    pub approval_mode: ChatApprovalMode,
+
+    #[arg(long, default_value_t = 8)]
+    pub max_agent_steps: usize,
+
     #[arg(long, default_value_t = false)]
     pub web: bool,
 
@@ -234,6 +289,25 @@ pub struct ChatArgs {
 
     #[arg(long, default_value_t = 200)]
     pub max_turns: usize,
+}
+
+impl Default for ChatArgs {
+    fn default() -> Self {
+        Self {
+            session_id: None,
+            provider: None,
+            system: None,
+            prompt: None,
+            autonomous: true,
+            approval_mode: ChatApprovalMode::Risky,
+            max_agent_steps: 8,
+            web: false,
+            approve_network: false,
+            approve_exec: false,
+            show_actions: true,
+            max_turns: 200,
+        }
+    }
 }
 
 #[derive(Debug, Args)]

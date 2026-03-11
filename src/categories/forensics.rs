@@ -9,13 +9,15 @@ pub fn plan() -> CategoryPlan {
                 confidence: 0.64,
             },
             HypothesisTemplate {
-                text: "Timeline reconstruction may reveal the intended extraction path.".to_string(),
+                text: "Timeline reconstruction may reveal the intended extraction path."
+                    .to_string(),
                 confidence: 0.49,
             },
         ],
         actions: vec![
             ActionSuggestion {
-                description: "Perform quick metadata triage (file/exiftool/capinfos/binwalk).".to_string(),
+                description: "Perform quick metadata triage (file/exiftool/capinfos/binwalk)."
+                    .to_string(),
                 command_preview: Some("file ./artifact && exiftool ./artifact".to_string()),
                 requires_network: false,
                 requires_install: false,

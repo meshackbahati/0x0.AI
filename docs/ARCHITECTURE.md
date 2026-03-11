@@ -10,11 +10,11 @@
 - `src/policy.rs`: safety policy enforcement
 - `src/storage.rs`: SQLite persistence (sessions/actions/artifacts/hypotheses/notes/citations/cache)
 - `src/ingest.rs`: artifact scanning and indexing
-- `src/planner.rs`: planner/executor/review solving loop
+- `src/planner.rs`: adaptive planner/executor/review solving loop
 - `src/tools/`: capability discovery, subprocess runner, package manager abstraction
 - `src/providers/`: provider abstraction, routing, retries, timeout, token budget
 - `src/research/`: local search + web research/caching/citation extraction
-- `src/categories/`: challenge category plans and heuristics
+- `src/categories/`: category plans/heuristics for crypto, pwn, rev, web, forensics, stego, osint, mobile, hardware, blockchain, cloud, network, ai, misc
 - `src/report.rs`: writeup and replay report generation
 - `src/web_lab.rs`: authorized web challenge mapping/replay/fuzz templates
 - `src/plugins.rs`: local plugin discovery and execution
@@ -26,6 +26,8 @@
 - Lazy and incremental processing where possible
 - Explicit policy checks before risky actions
 - Strong action logging for auditability
+- Observe-and-adapt loops: each action output influences next action selection
+- Tool-aware autonomy: only installed tools are proposed/executed by planner
 
 ## Persistence Model
 

@@ -5,11 +5,13 @@ pub fn plan() -> CategoryPlan {
         category: ChallengeCategory::Misc,
         hypotheses: vec![
             HypothesisTemplate {
-                text: "Challenge may require layered encoding/decoding and format conversion.".to_string(),
+                text: "Challenge may require layered encoding/decoding and format conversion."
+                    .to_string(),
                 confidence: 0.43,
             },
             HypothesisTemplate {
-                text: "Custom parser script can eliminate repetitive manual trial-and-error.".to_string(),
+                text: "Custom parser script can eliminate repetitive manual trial-and-error."
+                    .to_string(),
                 confidence: 0.39,
             },
         ],
@@ -21,7 +23,8 @@ pub fn plan() -> CategoryPlan {
                 requires_install: false,
             },
             ActionSuggestion {
-                description: "Build one-off parser/automation scratchpad and log dead ends.".to_string(),
+                description: "Build one-off parser/automation scratchpad and log dead ends."
+                    .to_string(),
                 command_preview: None,
                 requires_network: false,
                 requires_install: false,

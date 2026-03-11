@@ -61,6 +61,8 @@ pub struct ProvidersConfig {
     pub gemini: GeminiProvider,
     pub anthropic_compatible: Vec<AnthropicProvider>,
     pub custom_openai_compatible: Vec<NamedOpenAiCompatProvider>,
+    #[serde(default)]
+    pub generic_http: Vec<GenericHttpProvider>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +95,16 @@ pub struct GeminiProvider {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedOpenAiCompatProvider {
+    pub name: String,
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key_env: String,
+    pub api_key: Option<String>,
+    pub default_model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenericHttpProvider {
     pub name: String,
     pub enabled: bool,
     pub base_url: String,
@@ -261,6 +273,7 @@ impl Default for ProvidersConfig {
             },
             anthropic_compatible: Vec::new(),
             custom_openai_compatible: Vec::new(),
+            generic_http: Vec::new(),
         }
     }
 }
@@ -368,8 +381,7 @@ impl RuntimePaths {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         if let Some(parent) = self.config_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         Ok(())
     }
@@ -396,8 +408,10 @@ pub fn load_runtime_config(explicit_config: Option<PathBuf>) -> Result<RuntimeCo
 }
 
 pub fn load_config(path: &Path) -> Result<AppConfig> {
-    let content = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let cfg: AppConfig = toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+    let content =
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let cfg: AppConfig =
+        toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
     Ok(cfg)
 }
 

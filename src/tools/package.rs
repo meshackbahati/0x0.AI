@@ -94,10 +94,21 @@ pub fn build_install_plan(tool: &str, manager_hint: Option<PackageManager>) -> I
             package.clone(),
         ],
         PackageManager::Pipx => vec!["pipx".to_string(), "install".to_string(), package.clone()],
-        PackageManager::Pip => vec!["python3".to_string(), "-m".to_string(), "pip".to_string(), "install".to_string(), package.clone()],
+        PackageManager::Pip => vec![
+            "python3".to_string(),
+            "-m".to_string(),
+            "pip".to_string(),
+            "install".to_string(),
+            package.clone(),
+        ],
         PackageManager::Cargo => vec!["cargo".to_string(), "install".to_string(), package.clone()],
         PackageManager::Go => vec!["go".to_string(), "install".to_string(), package.clone()],
-        PackageManager::Npm => vec!["npm".to_string(), "install".to_string(), "-g".to_string(), package.clone()],
+        PackageManager::Npm => vec![
+            "npm".to_string(),
+            "install".to_string(),
+            "-g".to_string(),
+            package.clone(),
+        ],
         PackageManager::Unknown => vec![tool.to_string()],
     };
 

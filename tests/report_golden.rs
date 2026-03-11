@@ -38,9 +38,17 @@ fn writeup_matches_golden_fixture() {
     store
         .add_hypothesis("sess1", "Try common modulus attack", 0.7, "open")
         .expect("hypothesis");
-    store.add_note("sess1", "Need factorization sanity check").expect("note");
     store
-        .add_citation("sess1", "web", "https://example.com", Some("line:1"), "rsa background")
+        .add_note("sess1", "Need factorization sanity check")
+        .expect("note");
+    store
+        .add_citation(
+            "sess1",
+            "web",
+            "https://example.com",
+            Some("line:1"),
+            "rsa background",
+        )
         .expect("citation");
 
     store

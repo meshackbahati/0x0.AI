@@ -174,7 +174,11 @@ impl WebResearcher {
         if let Some(host) = parsed.host_str() {
             self.apply_rate_limit(host);
         }
-        let mut resp = self.client.get(url).send().with_context(|| format!("GET {url}"))?;
+        let mut resp = self
+            .client
+            .get(url)
+            .send()
+            .with_context(|| format!("GET {url}"))?;
         if !resp.status().is_success() {
             return Ok(String::new());
         }
@@ -349,7 +353,9 @@ fn extract_readable_text(html: &str) -> (Option<String>, String) {
         .map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let selectors = ["main", "article", "section", "p", "li", "pre", "code", "h1", "h2", "h3"];
+    let selectors = [
+        "main", "article", "section", "p", "li", "pre", "code", "h1", "h2", "h3",
+    ];
 
     let mut lines = Vec::new();
     for sel in selectors {

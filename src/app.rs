@@ -1,17 +1,25 @@
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+use std::time::Duration;
 use sysinfo::System;
 use uuid::Uuid;
 
 use crate::categories::{ChallengeCategory, infer_category};
 use crate::cli::{
-    ChatArgs, Cli, Commands, ConfigCommand, OutputFormat, ProvidersCommand, RouteTask, SetupArgs,
-    ToolsCommand, WebCommand, ProvidersConfigureArgs, ProviderCompat,
+    ChatApprovalMode, ChatArgs, Cli, Commands, ConfigCommand, OutputFormat, ProviderCompat,
+    ProvidersCommand, ProvidersConfigureArgs, RouteTask, SetupArgs, ToolsCommand, UpdateArgs,
+    WebCommand,
 };
 use crate::config::{AppConfig, RuntimeConfig, load_runtime_config, save_config};
 use crate::ingest::{ScanOptions, collect_signals_from_artifacts, scan_path};
@@ -27,7 +35,7 @@ use crate::research::web::WebResearcher;
 use crate::storage::{NewAction, StateStore};
 use crate::tools::package::{build_install_plan, detect_package_manager};
 use crate::tools::{ToolManager, ToolRunRequest};
-use crate::util::confirm;
+use crate::util::{confirm, shell_preview};
 use crate::web_lab::{generate_templates_and_notebook, map_target, parse_target, replay_request};
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -37,6 +45,9 @@ pub fn run(cli: Cli) -> Result<()> {
         runtime.config.safety.research_web_enabled = false;
     }
 
+    let dry_run = cli.dry_run;
+    let auto_yes = cli.yes;
+    let no_install = cli.no_install;
     let output_mode = resolve_output_mode(&cli, &runtime);
 
     let store = StateStore::open(
@@ -47,13 +58,17 @@ pub fn run(cli: Cli) -> Result<()> {
     )?;
 
     let policy = PolicyEngine::new(runtime.config.safety.clone())?;
-    let tools = ToolManager::new(runtime.config.tools.clone(), cli.dry_run);
+    let tools = ToolManager::new(runtime.config.tools.clone(), dry_run);
     let providers = ProviderManager::new(runtime.config.clone());
     let _plugins = PluginManager::new(runtime.paths.plugins_dir.clone());
+    let command = cli.command.unwrap_or(Commands::Chat(ChatArgs::default()));
 
-    match cli.command {
+    match command {
         Commands::Init(args) => cmd_init(args.path, args.force, &mut runtime, output_mode),
         Commands::Setup(args) => cmd_setup(args, &mut runtime, output_mode),
+        Commands::Update(args) => {
+            cmd_update(args, &runtime, &policy, &tools, auto_yes, output_mode)
+        }
         Commands::Scan(args) => {
             policy.ensure_path_allowed(&args.path)?;
             let session_id = ensure_session(&store, args.session_id.as_deref(), &args.path)?;
@@ -115,20 +130,23 @@ pub fn run(cli: Cli) -> Result<()> {
             )?;
 
             let mut approvals = Approvals {
-                network: args.approve_network || cli.yes,
-                exec: args.approve_exec || cli.yes,
-                install: args.approve_install || cli.yes,
+                network: args.approve_network || auto_yes,
+                exec: args.approve_exec || auto_yes,
+                install: args.approve_install || auto_yes,
             };
 
             if runtime.config.safety.require_confirmation_for_exec && !approvals.exec {
                 approvals.exec = confirm(
                     "Allow local command execution for solve workflow?",
-                    cli.yes,
+                    auto_yes,
                 )?;
             }
-            if args.web && runtime.config.safety.require_confirmation_for_network && !approvals.network {
+            if args.web
+                && runtime.config.safety.require_confirmation_for_network
+                && !approvals.network
+            {
                 approvals.network =
-                    confirm("Allow network actions against approved targets?", cli.yes)?;
+                    confirm("Allow network actions against approved targets?", auto_yes)?;
             }
 
             let outcome = solve_loop(
@@ -172,24 +190,29 @@ pub fn run(cli: Cli) -> Result<()> {
             policy.ensure_path_allowed(&args.path)?;
             let targets = collect_challenge_paths(&args.path, args.max_challenges)?;
             if targets.is_empty() {
-                bail!("no challenge targets discovered under {}", args.path.display());
+                bail!(
+                    "no challenge targets discovered under {}",
+                    args.path.display()
+                );
             }
 
             let mut approvals = Approvals {
-                network: args.approve_network || cli.yes,
-                exec: args.approve_exec || cli.yes,
-                install: args.approve_install || cli.yes,
+                network: args.approve_network || auto_yes,
+                exec: args.approve_exec || auto_yes,
+                install: args.approve_install || auto_yes,
             };
             if runtime.config.safety.require_confirmation_for_exec && !approvals.exec {
                 approvals.exec = confirm(
                     "Allow local command execution for solve-all workflow?",
-                    cli.yes,
+                    auto_yes,
                 )?;
             }
-            if args.web && runtime.config.safety.require_confirmation_for_network && !approvals.network
+            if args.web
+                && runtime.config.safety.require_confirmation_for_network
+                && !approvals.network
             {
                 approvals.network =
-                    confirm("Allow network actions against approved targets?", cli.yes)?;
+                    confirm("Allow network actions against approved targets?", auto_yes)?;
             }
 
             let mut outcomes = Vec::new();
@@ -286,20 +309,23 @@ pub fn run(cli: Cli) -> Result<()> {
                     .unwrap_or_else(|| infer_category(&signals));
 
                 let mut approvals = Approvals {
-                    network: args.approve_network || cli.yes,
-                    exec: args.approve_exec || cli.yes,
+                    network: args.approve_network || auto_yes,
+                    exec: args.approve_exec || auto_yes,
                     install: false,
                 };
 
                 if runtime.config.safety.require_confirmation_for_exec && !approvals.exec {
                     approvals.exec = confirm(
                         "Allow local command execution for resumed workflow?",
-                        cli.yes,
+                        auto_yes,
                     )?;
                 }
-                if args.web && runtime.config.safety.require_confirmation_for_network && !approvals.network {
+                if args.web
+                    && runtime.config.safety.require_confirmation_for_network
+                    && !approvals.network
+                {
                     approvals.network =
-                        confirm("Allow network actions against approved targets?", cli.yes)?;
+                        confirm("Allow network actions against approved targets?", auto_yes)?;
                 }
 
                 let outcome = solve_loop(
@@ -324,7 +350,11 @@ pub fn run(cli: Cli) -> Result<()> {
                     Some(&outcome.summary),
                 )?;
 
-                emit(output_mode, &outcome, &format!("resumed session {}", session.id))
+                emit(
+                    output_mode,
+                    &outcome,
+                    &format!("resumed session {}", session.id),
+                )
             } else {
                 let actions = store.list_actions(&session.id, 20)?;
                 let notes = store.list_notes(&session.id, 20)?;
@@ -336,6 +366,54 @@ pub fn run(cli: Cli) -> Result<()> {
                     "hypotheses": hypotheses,
                 });
                 emit(output_mode, &snapshot, "session snapshot emitted")
+            }
+        }
+        Commands::Sessions(args) => {
+            let limit = args.limit.clamp(1, 200);
+            let status = args
+                .status
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let category = normalize_category_filter(args.category.as_deref())?;
+
+            let sessions = store.list_session_summaries(limit, status, category.as_deref())?;
+
+            if output_mode == OutputMode::Json {
+                let payload = json!({
+                    "filters": {
+                        "limit": limit,
+                        "status": status,
+                        "category": category,
+                    },
+                    "sessions": sessions,
+                });
+                emit(output_mode, &payload, "session list emitted")
+            } else if sessions.is_empty() {
+                println!("No sessions found.");
+                Ok(())
+            } else {
+                println!("Recent sessions ({}):", sessions.len());
+                for s in sessions {
+                    println!(
+                        "{}  status={}  category={}  actions={}  artifacts={}  notes={}  updated={}  root={}",
+                        s.id,
+                        s.status,
+                        s.category.as_deref().unwrap_or("unknown"),
+                        s.action_count,
+                        s.artifact_count,
+                        s.note_count,
+                        s.updated_at,
+                        s.root_path
+                    );
+                    if let Some(summary) = s.summary.as_deref() {
+                        let summary = summary.trim();
+                        if !summary.is_empty() {
+                            println!("  summary: {}", truncate_for_prompt(summary, 160));
+                        }
+                    }
+                }
+                Ok(())
             }
         }
         Commands::Research(args) => {
@@ -355,7 +433,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
             let mut web_hits = Vec::new();
             let mut approvals = Approvals {
-                network: args.approve_network || cli.yes,
+                network: args.approve_network || auto_yes,
                 exec: false,
                 install: false,
             };
@@ -364,7 +442,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 if runtime.config.safety.require_confirmation_for_network && !approvals.network {
                     approvals.network = confirm(
                         "Allow passive web research (docs/public references only)?",
-                        cli.yes,
+                        auto_yes,
                     )?;
                 }
                 policy.ensure_network_allowed(approvals, "public-web", None, true)?;
@@ -411,7 +489,7 @@ pub fn run(cli: Cli) -> Result<()> {
             &policy,
             &tools,
             &providers,
-            cli.yes,
+            auto_yes,
             output_mode,
         ),
         Commands::Note(args) => {
@@ -445,20 +523,23 @@ pub fn run(cli: Cli) -> Result<()> {
                 emit(output_mode, &payload, &text)
             }
             ToolsCommand::Install(install_args) => {
-                if cli.no_install {
+                if no_install {
                     bail!("install denied by --no-install");
                 }
 
                 let mut approvals = Approvals {
                     network: false,
-                    exec: cli.yes,
-                    install: install_args.approve_install || cli.yes,
+                    exec: auto_yes,
+                    install: install_args.approve_install || auto_yes,
                 };
 
                 if runtime.config.safety.require_confirmation_for_install && !approvals.install {
                     approvals.install = confirm(
-                        &format!("Install tool '{}' using package manager?", install_args.tool),
-                        cli.yes,
+                        &format!(
+                            "Install tool '{}' using package manager?",
+                            install_args.tool
+                        ),
+                        auto_yes,
                     )?;
                 }
 
@@ -533,7 +614,8 @@ pub fn run(cli: Cli) -> Result<()> {
                         &provider,
                         ProviderRequest {
                             system: Some(
-                                "You are running a provider connectivity and behavior test.".to_string(),
+                                "You are running a provider connectivity and behavior test."
+                                    .to_string(),
                             ),
                             prompt: test_args.prompt.clone(),
                             task_type: TaskType::Reasoning,
@@ -579,7 +661,12 @@ pub fn run(cli: Cli) -> Result<()> {
                 configure_provider(&mut runtime.config, &cfg_args)?;
 
                 if let Some(route) = cfg_args.route.clone() {
-                    set_route(&mut runtime.config, route, &cfg_args.provider, cfg_args.model.clone());
+                    set_route(
+                        &mut runtime.config,
+                        route,
+                        &cfg_args.provider,
+                        cfg_args.model.clone(),
+                    );
                 }
 
                 save_config(&runtime.paths.config_path, &runtime.config)?;
@@ -592,13 +679,15 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             ProvidersCommand::Models(model_args) => {
                 let mut approvals = Approvals {
-                    network: cli.yes,
+                    network: auto_yes,
                     exec: false,
                     install: false,
                 };
                 if runtime.config.safety.require_confirmation_for_network && !approvals.network {
-                    approvals.network =
-                        confirm("Allow network access to provider APIs for model listing?", cli.yes)?;
+                    approvals.network = confirm(
+                        "Allow network access to provider APIs for model listing?",
+                        auto_yes,
+                    )?;
                 }
                 policy.ensure_network_allowed(approvals, "provider-apis", None, true)?;
                 let models = providers.list_models(model_args.provider.as_deref())?;
@@ -624,15 +713,12 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Web(args) => match args.command {
             WebCommand::Map(map_args) => {
                 let target = parse_target(&map_args.target)?;
-                let session_id = ensure_session_label(
-                    &store,
-                    map_args.session_id.as_deref(),
-                    &target.base_url,
-                )?;
+                let session_id =
+                    ensure_session_label(&store, map_args.session_id.as_deref(), &target.base_url)?;
 
                 let mut approvals = Approvals {
-                    network: map_args.approve_network || cli.yes,
-                    exec: map_args.approve_exec || cli.yes,
+                    network: map_args.approve_network || auto_yes,
+                    exec: map_args.approve_exec || auto_yes,
                     install: false,
                 };
 
@@ -642,12 +728,12 @@ pub fn run(cli: Cli) -> Result<()> {
                             "Allow web mapping against approved target {}:{} ?",
                             target.host, target.port
                         ),
-                        cli.yes,
+                        auto_yes,
                     )?;
                 }
                 if runtime.config.safety.require_confirmation_for_exec && !approvals.exec {
                     approvals.exec =
-                        confirm("Allow local command execution for web mapping?", cli.yes)?;
+                        confirm("Allow local command execution for web mapping?", auto_yes)?;
                 }
 
                 let out_dir = map_args
@@ -692,7 +778,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 for template in &report.fuzz_templates {
                     let _ = store.add_note(
                         &session_id,
-                        &format!("web-fuzz-template [{}]: {}", template.name, template.command_preview),
+                        &format!(
+                            "web-fuzz-template [{}]: {}",
+                            template.name, template.command_preview
+                        ),
                     );
                 }
 
@@ -717,8 +806,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 )?;
 
                 let mut approvals = Approvals {
-                    network: replay_args.approve_network || cli.yes,
-                    exec: replay_args.approve_exec || cli.yes,
+                    network: replay_args.approve_network || auto_yes,
+                    exec: replay_args.approve_exec || auto_yes,
                     install: false,
                 };
 
@@ -728,12 +817,14 @@ pub fn run(cli: Cli) -> Result<()> {
                             "Allow request replay against approved target {}:{} ?",
                             target.host, target.port
                         ),
-                        cli.yes,
+                        auto_yes,
                     )?;
                 }
                 if runtime.config.safety.require_confirmation_for_exec && !approvals.exec {
-                    approvals.exec =
-                        confirm("Allow local command execution for request replay?", cli.yes)?;
+                    approvals.exec = confirm(
+                        "Allow local command execution for request replay?",
+                        auto_yes,
+                    )?;
                 }
 
                 let report = replay_request(
@@ -777,7 +868,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 let out_dir = template_args
                     .out
                     .unwrap_or_else(|| runtime.paths.state_dir.join("payload_notebooks"));
-                let (templates, notebook_path) = generate_templates_and_notebook(&target, &out_dir)?;
+                let (templates, notebook_path) =
+                    generate_templates_and_notebook(&target, &out_dir)?;
                 let payload = json!({
                     "target": target,
                     "templates": templates,
@@ -788,11 +880,15 @@ pub fn run(cli: Cli) -> Result<()> {
         },
         Commands::Writeup(args) => {
             let bundle = build_writeup(&store, &args.session_id)?;
-            let out = args
-                .out
-                .unwrap_or_else(|| runtime.paths.writeups_dir.join(format!("{}.md", args.session_id)));
+            let out = args.out.unwrap_or_else(|| {
+                runtime
+                    .paths
+                    .writeups_dir
+                    .join(format!("{}.md", args.session_id))
+            });
             write_writeup(&out, &bundle.markdown)?;
-            let payload = json!({"session_id": args.session_id, "path": out, "bytes": bundle.markdown.len()});
+            let payload =
+                json!({"session_id": args.session_id, "path": out, "bytes": bundle.markdown.len()});
             emit(
                 output_mode,
                 &payload,
@@ -817,11 +913,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
                 let approvals = Approvals {
                     network: false,
-                    exec: cli.yes
-                        || confirm(
-                            &format!("Open config with editor '{}' ?", editor),
-                            cli.yes,
-                        )?,
+                    exec: auto_yes
+                        || confirm(&format!("Open config with editor '{}' ?", editor), auto_yes)?,
                     install: false,
                 };
                 policy.ensure_exec_allowed(approvals, &editor)?;
@@ -836,9 +929,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 emit(output_mode, &payload, "config edit command executed")
             }
             ConfigCommand::Show => {
-                let text = fs::read_to_string(&runtime.paths.config_path).with_context(|| {
-                    format!("reading {}", runtime.paths.config_path.display())
-                })?;
+                let text = fs::read_to_string(&runtime.paths.config_path)
+                    .with_context(|| format!("reading {}", runtime.paths.config_path.display()))?;
                 if output_mode == OutputMode::Json {
                     let cfg_json: serde_json::Value = toml::from_str::<toml::Value>(&text)
                         .map(serde_json::to_value)?
@@ -881,7 +973,12 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn cmd_init(path: PathBuf, force: bool, runtime: &mut RuntimeConfig, mode: OutputMode) -> Result<()> {
+fn cmd_init(
+    path: PathBuf,
+    force: bool,
+    runtime: &mut RuntimeConfig,
+    mode: OutputMode,
+) -> Result<()> {
     runtime.paths.ensure_dirs()?;
 
     if force {
@@ -936,6 +1033,8 @@ fn cmd_setup(args: SetupArgs, runtime: &mut RuntimeConfig, mode: OutputMode) -> 
         configure_provider(&mut runtime.config, &configure)?;
         if let Some(route) = args.route {
             set_route(&mut runtime.config, route, &provider, args.model.clone());
+        } else {
+            bind_default_chat_routes(&mut runtime.config, &provider, args.model.clone());
         }
         save_config(&runtime.paths.config_path, &runtime.config)?;
         let payload = redacted_provider_view(&runtime.config, &provider);
@@ -945,13 +1044,18 @@ fn cmd_setup(args: SetupArgs, runtime: &mut RuntimeConfig, mode: OutputMode) -> 
     println!("0x0.AI provider setup wizard");
     println!("Use Ctrl+C to abort.");
 
-    let provider = prompt_required("Provider (openai/openrouter/together/gemini/moonshot/anthropic): ")?;
+    let provider =
+        prompt_required("Provider (openai/openrouter/together/gemini/moonshot/anthropic): ")?;
     let api_key = prompt_optional("API key (leave empty to use env var): ")?;
     let api_key_env = prompt_optional("API key env var (optional): ")?;
     let model = prompt_optional("Default model (optional): ")?;
     let base_url = prompt_optional("Base URL override (optional): ")?;
-    let route = prompt_optional("Route task [reasoning|coding|summarization|vision|classification] (optional): ")?;
-    let compat = prompt_optional("Compatibility [openai|anthropic] for custom providers (optional): ")?;
+    let route = prompt_optional(
+        "Route task [reasoning|coding|summarization|vision|classification] (optional): ",
+    )?;
+    let compat = prompt_optional(
+        "Compatibility [openai|anthropic|generic] for custom providers (optional): ",
+    )?;
 
     let route_task = route
         .as_deref()
@@ -979,11 +1083,153 @@ fn cmd_setup(args: SetupArgs, runtime: &mut RuntimeConfig, mode: OutputMode) -> 
     configure_provider(&mut runtime.config, &configure)?;
     if let Some(task) = route_task {
         set_route(&mut runtime.config, task, &provider, model);
+    } else {
+        bind_default_chat_routes(&mut runtime.config, &provider, model);
     }
     save_config(&runtime.paths.config_path, &runtime.config)?;
 
     let payload = redacted_provider_view(&runtime.config, &provider);
     emit(mode, &payload, "setup completed")
+}
+
+fn cmd_update(
+    args: UpdateArgs,
+    runtime: &RuntimeConfig,
+    policy: &PolicyEngine,
+    tools: &ToolManager,
+    auto_yes: bool,
+    mode: OutputMode,
+) -> Result<()> {
+    if args.system && args.user {
+        bail!("choose only one mode: --system or --user");
+    }
+
+    let mut approvals = Approvals {
+        network: false,
+        exec: auto_yes,
+        install: auto_yes,
+    };
+
+    if runtime.config.safety.require_confirmation_for_install && !approvals.install {
+        approvals.install = confirm(
+            "Allow self-update (download and reinstall 0x0.AI from GitHub)?",
+            auto_yes,
+        )?;
+    }
+    policy.ensure_install_allowed(approvals, "0x0-ai-self-update")?;
+
+    if runtime.config.safety.require_confirmation_for_exec && !approvals.exec {
+        approvals.exec = confirm("Allow running updater script?", auto_yes)?;
+    }
+    policy.ensure_exec_allowed(approvals, "bash")?;
+
+    let mut update_args = Vec::new();
+    if args.system {
+        update_args.push("--system".to_string());
+    } else if args.user {
+        update_args.push("--user".to_string());
+    }
+    if let Some(branch) = args.branch {
+        update_args.push("--branch".to_string());
+        update_args.push(branch);
+    }
+    if let Some(reference) = args.reference {
+        update_args.push("--reference".to_string());
+        update_args.push(reference);
+    }
+    if args.prefer_commit {
+        update_args.push("--prefer-commit".to_string());
+    }
+    if args.dry_run {
+        update_args.push("--dry-run".to_string());
+    }
+
+    let local_script = std::env::current_dir()?.join("scripts/update.sh");
+    let (source, result) = if local_script.exists() {
+        let mut cmd_args = vec![local_script.display().to_string()];
+        cmd_args.extend(update_args.clone());
+        let res = tools.run(ToolRunRequest {
+            program: "bash".to_string(),
+            args: cmd_args,
+            cwd: None,
+            timeout_secs: Some(3600),
+        })?;
+        ("local-script".to_string(), res)
+    } else {
+        let mut remote_cmd = String::from(
+            "curl -fsSL https://raw.githubusercontent.com/meshackbahati/0x0.AI/main/scripts/update.sh | bash -s --",
+        );
+        for arg in &update_args {
+            remote_cmd.push(' ');
+            remote_cmd.push_str(&shell_escape::escape(arg.as_str().into()).to_string());
+        }
+        let res = tools.run(ToolRunRequest {
+            program: "bash".to_string(),
+            args: vec!["-lc".to_string(), remote_cmd],
+            cwd: None,
+            timeout_secs: Some(3600),
+        })?;
+        ("remote-script".to_string(), res)
+    };
+
+    let payload = json!({
+        "source": source,
+        "args": update_args,
+        "result": result,
+    });
+
+    emit(mode, &payload, "update command executed")
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentDecision {
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    message: String,
+    action: Option<AgentAction>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AgentAction {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    risk: String,
+    #[serde(default)]
+    requires_network: bool,
+    host: Option<String>,
+    port: Option<u16>,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentRisk {
+    Low,
+    Medium,
+    High,
+}
+
+impl AgentRisk {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
 }
 
 fn cmd_chat(
@@ -1003,6 +1249,8 @@ fn cmd_chat(
         Some("misc"),
         Some("interactive chat session"),
     )?;
+    let mut current_session_id = session_id;
+    let mut flag_prefix: Option<String> = None;
 
     let mut approvals = Approvals {
         network: args.approve_network || auto_yes,
@@ -1017,6 +1265,13 @@ fn cmd_chat(
         )?;
     }
 
+    if args.autonomous && runtime.config.safety.require_confirmation_for_exec && !approvals.exec {
+        approvals.exec = confirm(
+            "Allow autonomous mode to execute local commands (risky actions still require approval)?",
+            auto_yes,
+        )?;
+    }
+
     let mut web_researcher = if args.web {
         Some(WebResearcher::new(runtime.config.research.clone())?)
     } else {
@@ -1027,32 +1282,61 @@ fn cmd_chat(
     policy.ensure_path_allowed(&cwd)?;
 
     if let Some(one_shot) = args.prompt.as_deref() {
-        let reply = chat_turn(
-            one_shot,
-            &args,
-            &session_id,
-            store,
-            policy,
-            tools,
-            providers,
-            &cwd,
-            &mut web_researcher,
-            approvals,
-            output_mode,
-            auto_yes,
-        )?;
+        if let Some(prefix) = extract_flag_prefix_hint(one_shot) {
+            flag_prefix = Some(prefix.clone());
+            let _ = store.add_note(
+                &current_session_id,
+                &format!("flag-prefix(auto-detected): {}", prefix),
+            );
+        }
+        let reply = if args.autonomous {
+            autonomous_chat_turn(
+                one_shot,
+                &args,
+                &current_session_id,
+                store,
+                policy,
+                tools,
+                providers,
+                &cwd,
+                &mut web_researcher,
+                &mut approvals,
+                output_mode,
+                auto_yes,
+                flag_prefix.as_deref(),
+            )?
+        } else {
+            chat_turn(
+                one_shot,
+                &args,
+                &current_session_id,
+                store,
+                policy,
+                tools,
+                providers,
+                &cwd,
+                &mut web_researcher,
+                &mut approvals,
+                output_mode,
+                auto_yes,
+            )?
+        };
 
         if output_mode == OutputMode::Json {
-            println!("{}", serde_json::to_string_pretty(&json!({
-                "session_id": session_id,
-                "reply": reply,
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "session_id": current_session_id,
+                    "reply": reply,
+                }))?
+            );
         }
         return Ok(());
     }
 
-    println!("Chat session: {}", session_id);
-    println!("Commands: /help, /exit, /run <cmd>, /research <query>");
+    println!("Chat session: {}", current_session_id);
+    print_chat_help(args.autonomous);
+    print_chat_constraints(runtime, &args, &approvals);
 
     let mut turns = 0usize;
     loop {
@@ -1073,34 +1357,245 @@ fn cmd_chat(
         if line.is_empty() {
             continue;
         }
+        if let Some(prefix) = extract_flag_prefix_hint(line)
+            && flag_prefix.as_deref() != Some(prefix.as_str())
+        {
+            flag_prefix = Some(prefix.clone());
+            let _ = store.add_note(
+                &current_session_id,
+                &format!("flag-prefix(auto-detected): {}", prefix),
+            );
+            println!("[agent] detected flag prefix: {}", prefix);
+        }
         if matches!(line, "/exit" | "exit" | "quit") {
             break;
         }
         if line == "/help" {
-            println!("Available:");
-            println!("/run <command>          execute local command through policy wrapper");
-            println!("/research <query>       local + optional web research");
-            println!("/exit                   leave chat");
+            print_chat_help(args.autonomous);
+            continue;
+        }
+        if line == "/sessions" {
+            let sessions = store.list_sessions(10)?;
+            if sessions.is_empty() {
+                println!("No sessions yet.");
+            } else {
+                println!("Recent sessions:");
+                for s in sessions {
+                    println!(
+                        "{}  status={}  updated={}  root={}",
+                        s.id, s.status, s.updated_at, s.root_path
+                    );
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/resume ") {
+            let target = rest.trim();
+            if target.is_empty() {
+                println!("Usage: /resume <session-id>");
+                continue;
+            }
+            if store.get_session(target)?.is_some() {
+                current_session_id = target.to_string();
+                println!("Resumed session: {}", current_session_id);
+            } else {
+                println!("Session not found: {}", target);
+            }
+            continue;
+        }
+        if line == "/constraints" {
+            print_chat_constraints(runtime, &args, &approvals);
+            continue;
+        }
+        if matches!(line, "/clean" | "/clear") {
+            print!("\x1B[2J\x1B[H");
+            io::stdout().flush()?;
+            continue;
+        }
+        if line == "/ps" {
+            let _ = chat_turn(
+                "/run ps aux",
+                &args,
+                &current_session_id,
+                store,
+                policy,
+                tools,
+                providers,
+                &cwd,
+                &mut web_researcher,
+                &mut approvals,
+                OutputMode::Text,
+                auto_yes,
+            )?;
+            continue;
+        }
+        if line == "/ls" {
+            let _ = chat_turn(
+                "/run ls -la",
+                &args,
+                &current_session_id,
+                store,
+                policy,
+                tools,
+                providers,
+                &cwd,
+                &mut web_researcher,
+                &mut approvals,
+                OutputMode::Text,
+                auto_yes,
+            )?;
+            continue;
+        }
+        if line == "/pwd" {
+            let _ = chat_turn(
+                "/run pwd",
+                &args,
+                &current_session_id,
+                store,
+                policy,
+                tools,
+                providers,
+                &cwd,
+                &mut web_researcher,
+                &mut approvals,
+                OutputMode::Text,
+                auto_yes,
+            )?;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/ask ") {
+            let _ = chat_turn(
+                rest,
+                &args,
+                &current_session_id,
+                store,
+                policy,
+                tools,
+                providers,
+                &cwd,
+                &mut web_researcher,
+                &mut approvals,
+                OutputMode::Text,
+                auto_yes,
+            )?;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/auto ") {
+            let _ = autonomous_chat_turn(
+                rest,
+                &args,
+                &current_session_id,
+                store,
+                policy,
+                tools,
+                providers,
+                &cwd,
+                &mut web_researcher,
+                &mut approvals,
+                OutputMode::Text,
+                auto_yes,
+                flag_prefix.as_deref(),
+            )?;
             continue;
         }
 
-        let _ = chat_turn(
-            line,
-            &args,
-            &session_id,
-            store,
-            policy,
-            tools,
-            providers,
-            &cwd,
-            &mut web_researcher,
-            approvals,
-            OutputMode::Text,
-            auto_yes,
-        )?;
+        let _ = if args.autonomous {
+            autonomous_chat_turn(
+                line,
+                &args,
+                &current_session_id,
+                store,
+                policy,
+                tools,
+                providers,
+                &cwd,
+                &mut web_researcher,
+                &mut approvals,
+                OutputMode::Text,
+                auto_yes,
+                flag_prefix.as_deref(),
+            )?
+        } else {
+            chat_turn(
+                line,
+                &args,
+                &current_session_id,
+                store,
+                policy,
+                tools,
+                providers,
+                &cwd,
+                &mut web_researcher,
+                &mut approvals,
+                OutputMode::Text,
+                auto_yes,
+            )?
+        };
     }
 
     Ok(())
+}
+
+fn print_chat_help(autonomous_default: bool) {
+    println!("Commands:");
+    println!("/help                    show command list");
+    println!("/sessions                list recent session IDs");
+    println!("/resume <session-id>     switch chat to an existing session");
+    println!("/constraints             show active safety constraints");
+    println!("/run <command>           execute local command through policy wrapper");
+    println!("/ps                      shortcut for /run ps aux");
+    println!("/ls                      shortcut for /run ls -la");
+    println!("/pwd                     shortcut for /run pwd");
+    println!("/clean                   clear terminal screen");
+    println!("/research <query>        local + optional web research");
+    println!("/ask <prompt>            normal chat answer (no autonomous loop)");
+    println!("/auto <goal>             autonomous action loop for one goal");
+    println!("/exit                    leave chat");
+    if autonomous_default {
+        println!("Default mode: autonomous (/auto). Use /ask for direct answers.");
+    } else {
+        println!("Default mode: direct answers. Use /auto to enable autonomous steps.");
+    }
+}
+
+fn print_chat_constraints(runtime: &RuntimeConfig, args: &ChatArgs, approvals: &Approvals) {
+    let safety = &runtime.config.safety;
+    let paths = safety
+        .allowed_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hosts = if safety.allowed_hosts.is_empty() {
+        "(none)".to_string()
+    } else {
+        safety.allowed_hosts.join(", ")
+    };
+    let ports = safety
+        .allowed_ports
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    println!("Constraints:");
+    println!("offline_only={}", safety.offline_only);
+    println!("allowed_paths={paths}");
+    println!("allowed_hosts={hosts}");
+    println!("allowed_ports={ports}");
+    println!(
+        "approval_mode={} autonomous={} max_agent_steps={}",
+        match args.approval_mode {
+            ChatApprovalMode::All => "all",
+            ChatApprovalMode::Risky => "risky",
+        },
+        args.autonomous,
+        args.max_agent_steps
+    );
+    println!(
+        "session_approvals: exec={} network={}",
+        approvals.exec, approvals.network
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1114,7 +1609,7 @@ fn chat_turn(
     providers: &ProviderManager,
     cwd: &Path,
     web_researcher: &mut Option<WebResearcher>,
-    mut approvals: Approvals,
+    approvals: &mut Approvals,
     output_mode: OutputMode,
     auto_yes: bool,
 ) -> Result<String> {
@@ -1124,7 +1619,7 @@ fn chat_turn(
         if policy.config().require_confirmation_for_exec && !approvals.exec {
             approvals.exec = confirm("Allow command execution for this chat turn?", auto_yes)?;
         }
-        policy.ensure_exec_allowed(approvals, "chat-run")?;
+        policy.ensure_exec_allowed(*approvals, "chat-run")?;
 
         let parts = rest
             .split_whitespace()
@@ -1166,14 +1661,20 @@ fn chat_turn(
 
     if let Some(query) = line.strip_prefix("/research ") {
         let mut local_hits = search_local(query, cwd, store, Some(session_id), 5)?;
-        if args.show_actions {
+        if args.show_actions && output_mode == OutputMode::Text {
             println!("[action] local-search hits={}", local_hits.len());
         }
         let mut web_hits = Vec::new();
         if let Some(researcher) = web_researcher.as_mut() {
-            policy.ensure_network_allowed(approvals, "public-web", None, true)?;
+            if policy.config().require_confirmation_for_network && !approvals.network {
+                approvals.network = confirm(
+                    "Allow passive web research in chat mode (docs/public references only)?",
+                    auto_yes,
+                )?;
+            }
+            policy.ensure_network_allowed(*approvals, "public-web", None, true)?;
             web_hits = researcher.search(query, 3, store)?;
-            if args.show_actions {
+            if args.show_actions && output_mode == OutputMode::Text {
                 println!("[action] web-search hits={}", web_hits.len());
             }
         }
@@ -1206,7 +1707,7 @@ fn chat_turn(
     }
 
     let local_hits = search_local(line, cwd, store, Some(session_id), 4)?;
-    if args.show_actions {
+    if args.show_actions && output_mode == OutputMode::Text {
         println!("[action] local-context hits={}", local_hits.len());
     }
 
@@ -1221,7 +1722,10 @@ fn chat_turn(
     let prompt = if context.is_empty() {
         line.to_string()
     } else {
-        format!("User prompt:\n{}\n\nRelevant local context:\n{}", line, context)
+        format!(
+            "User prompt:\n{}\n\nRelevant local context:\n{}",
+            line, context
+        )
     };
 
     let mut stream_buf = String::new();
@@ -1234,10 +1738,9 @@ fn chat_turn(
     };
 
     let req = ProviderRequest {
-        system: args
-            .system
-            .clone()
-            .or_else(|| Some("You are 0x0.AI, a transparent terminal copilot. Explain exactly what you did and why.".to_string())),
+        system: args.system.clone().or_else(|| {
+            Some("You are 0x0.AI, a transparent terminal copilot. Explain exactly what you did and why.".to_string())
+        }),
         prompt,
         task_type: TaskType::Reasoning,
         max_tokens: 600,
@@ -1246,7 +1749,7 @@ fn chat_turn(
         model_override: None,
     };
 
-    if args.show_actions {
+    if args.show_actions && output_mode == OutputMode::Text {
         let provider_name = args
             .provider
             .clone()
@@ -1315,6 +1818,833 @@ fn chat_turn(
     }
 
     Ok(assistant_text)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn autonomous_chat_turn(
+    goal: &str,
+    args: &ChatArgs,
+    session_id: &str,
+    store: &StateStore,
+    policy: &PolicyEngine,
+    tools: &ToolManager,
+    providers: &ProviderManager,
+    cwd: &Path,
+    web_researcher: &mut Option<WebResearcher>,
+    approvals: &mut Approvals,
+    output_mode: OutputMode,
+    auto_yes: bool,
+    flag_prefix: Option<&str>,
+) -> Result<String> {
+    let goal = goal.trim();
+    if goal.is_empty() {
+        return Ok(String::new());
+    }
+
+    let _ = store.add_note(session_id, &format!("user: {}", goal));
+
+    let local_hits = search_local(goal, cwd, store, Some(session_id), 4)?;
+    if args.show_actions && output_mode == OutputMode::Text {
+        println!("[agent] local-context hits={}", local_hits.len());
+    }
+    let mut local_context = String::new();
+    for hit in &local_hits {
+        local_context.push_str(&format!(
+            "source={} locator={:?} snippet={}\n",
+            hit.citation.source, hit.citation.locator, hit.citation.snippet
+        ));
+    }
+
+    let mut observations: Vec<String> = Vec::new();
+    let mut concept_context = String::new();
+    let mut failed_actions = HashSet::new();
+    let mut consecutive_failures = 0usize;
+    let available_tools = tools
+        .discover_default_tools()
+        .into_iter()
+        .filter(|t| t.available)
+        .map(|t| t.name)
+        .collect::<Vec<_>>();
+    if args.show_actions && output_mode == OutputMode::Text {
+        println!("[agent] available-tools={}", available_tools.join(", "));
+        if let Some(prefix) = flag_prefix {
+            println!("[agent] expected-flag-prefix={prefix}");
+        }
+    }
+
+    for step in 1..=args.max_agent_steps {
+        let prompt = build_agent_prompt(
+            goal,
+            cwd,
+            &local_context,
+            &concept_context,
+            &observations,
+            &available_tools,
+            step,
+            args.max_agent_steps,
+            consecutive_failures,
+            flag_prefix,
+        );
+        if args.show_actions && output_mode == OutputMode::Text {
+            let provider_name = args
+                .provider
+                .clone()
+                .unwrap_or_else(|| providers.provider_for_task(TaskType::Reasoning));
+            println!("[agent] step={step} provider={provider_name}");
+        }
+
+        let req = ProviderRequest {
+            system: args.system.clone().or_else(|| {
+                Some("You are 0x0.AI autonomous mode. Plan one deterministic action at a time and output strict JSON only.".to_string())
+            }),
+            prompt,
+            task_type: TaskType::Reasoning,
+            max_tokens: 700,
+            temperature: 0.1,
+            timeout_secs: 60,
+            model_override: None,
+        };
+
+        let response = with_terminal_spinner(
+            args.show_actions && output_mode == OutputMode::Text,
+            "[agent] thinking",
+            || {
+                if let Some(p) = &args.provider {
+                    providers.call_with_provider(p, req, None)
+                } else {
+                    providers.call(req, None)
+                }
+            },
+        )?;
+
+        let raw_text = response.text.clone();
+        let meta = json!({
+            "provider": response.provider,
+            "model": response.model,
+            "prompt_tokens_est": response.prompt_tokens_est,
+            "completion_tokens_est": response.completion_tokens_est,
+            "step": step,
+        });
+        store.add_action(NewAction {
+            session_id,
+            action_type: "chat-agent-plan",
+            command: "provider.generate",
+            target: None,
+            status: "ok",
+            stdout: Some(&raw_text),
+            stderr: None,
+            metadata: Some(&meta),
+        })?;
+
+        let decision = match parse_agent_decision(&raw_text) {
+            Some(d) => d,
+            None => {
+                if output_mode == OutputMode::Text {
+                    println!("{}", raw_text);
+                }
+                let _ = store.add_note(session_id, &format!("assistant: {}", raw_text));
+                return Ok(raw_text);
+            }
+        };
+
+        let mode = if decision.mode.trim().is_empty() {
+            "respond".to_string()
+        } else {
+            decision.mode.trim().to_ascii_lowercase()
+        };
+        let message = decision.message.trim().to_string();
+        if !message.is_empty() && output_mode == OutputMode::Text {
+            println!("{}", message);
+        }
+
+        if mode != "act" || decision.action.is_none() {
+            let final_text = if message.is_empty() {
+                raw_text
+            } else {
+                message
+            };
+            let _ = store.add_note(session_id, &format!("assistant: {}", final_text));
+            return Ok(final_text);
+        }
+
+        let action = decision.action.as_ref().expect("action checked");
+        let preview = shell_preview(&action.program, &action.args);
+
+        if failed_actions.contains(&preview) {
+            let observation = format!(
+                "blocked: repeated failed action skipped to force a different strategy ({preview})"
+            );
+            store.add_action(NewAction {
+                session_id,
+                action_type: "chat-agent-run",
+                command: &preview,
+                target: action.host.as_deref(),
+                status: "skipped",
+                stdout: None,
+                stderr: Some(&observation),
+                metadata: Some(&json!({"step": step, "reason": "repeated-failed-action"})),
+            })?;
+            if output_mode == OutputMode::Text {
+                println!("[agent-action] {}", observation);
+            }
+            observations.push(observation);
+            consecutive_failures += 1;
+        } else {
+            let observation = execute_agent_action(
+                step,
+                action,
+                args,
+                session_id,
+                store,
+                policy,
+                tools,
+                cwd,
+                approvals,
+                output_mode,
+                auto_yes,
+                flag_prefix,
+            )?;
+
+            if is_failure_observation(&observation) {
+                failed_actions.insert(preview);
+                consecutive_failures += 1;
+            } else {
+                consecutive_failures = 0;
+            }
+            observations.push(observation);
+        }
+
+        if consecutive_failures >= 2 {
+            let research = run_autonomous_concept_research(
+                goal,
+                &observations,
+                args,
+                session_id,
+                cwd,
+                store,
+                policy,
+                web_researcher,
+                approvals,
+                output_mode,
+                auto_yes,
+            )?;
+            if !research.trim().is_empty() {
+                concept_context.push_str(&research);
+                if !concept_context.ends_with('\n') {
+                    concept_context.push('\n');
+                }
+            }
+            consecutive_failures = 0;
+        }
+    }
+
+    let final_text = format!(
+        "Reached autonomous step limit ({}). Run /auto <goal> to continue.",
+        args.max_agent_steps
+    );
+    if output_mode == OutputMode::Text {
+        println!("{}", final_text);
+    }
+    let _ = store.add_note(session_id, &format!("assistant: {}", final_text));
+    Ok(final_text)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_agent_action(
+    step: usize,
+    action: &AgentAction,
+    args: &ChatArgs,
+    session_id: &str,
+    store: &StateStore,
+    policy: &PolicyEngine,
+    tools: &ToolManager,
+    cwd: &Path,
+    approvals: &mut Approvals,
+    output_mode: OutputMode,
+    auto_yes: bool,
+    flag_prefix: Option<&str>,
+) -> Result<String> {
+    let program = action.program.trim();
+    if program.is_empty() {
+        return Ok("blocked: empty program".to_string());
+    }
+
+    let preview = shell_preview(program, &action.args);
+    let risk = classify_action_risk(action);
+    let confirm_action =
+        action_needs_confirmation(args.approval_mode, risk, action.requires_network);
+
+    if args.show_actions && output_mode == OutputMode::Text {
+        println!(
+            "[agent-action] step={} risk={} network={} cmd={}",
+            step,
+            risk.as_str(),
+            action.requires_network,
+            preview
+        );
+        if !action.reason.trim().is_empty() {
+            println!("[agent-action] reason={}", action.reason.trim());
+        }
+    }
+
+    if confirm_action {
+        let reason_suffix = if action.reason.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" reason: {}", action.reason.trim())
+        };
+        let approved = confirm(
+            &format!(
+                "Approve {}-risk action? {}{}",
+                risk.as_str(),
+                preview,
+                reason_suffix
+            ),
+            auto_yes,
+        )?;
+        if !approved {
+            let err = "action declined by user".to_string();
+            store.add_action(NewAction {
+                session_id,
+                action_type: "chat-agent-run",
+                command: &preview,
+                target: action.host.as_deref(),
+                status: "blocked",
+                stdout: None,
+                stderr: Some(&err),
+                metadata: Some(&json!({"step": step, "risk": risk.as_str(), "network": action.requires_network})),
+            })?;
+            if output_mode == OutputMode::Text {
+                println!("[agent-action] blocked: {}", err);
+            }
+            return Ok(format!("blocked: {}", err));
+        }
+    }
+
+    if policy.config().require_confirmation_for_exec && !approvals.exec {
+        approvals.exec = confirm("Allow command execution for autonomous mode?", auto_yes)?;
+    }
+    if let Err(err) = policy.ensure_exec_allowed(*approvals, program) {
+        let err_text = err.to_string();
+        store.add_action(NewAction {
+            session_id,
+            action_type: "chat-agent-run",
+            command: &preview,
+            target: action.host.as_deref(),
+            status: "blocked",
+            stdout: None,
+            stderr: Some(&err_text),
+            metadata: Some(
+                &json!({"step": step, "risk": risk.as_str(), "network": action.requires_network}),
+            ),
+        })?;
+        if output_mode == OutputMode::Text {
+            println!("[agent-action] blocked: {}", err_text);
+        }
+        return Ok(format!("blocked: {}", err_text));
+    }
+
+    if action.requires_network {
+        if policy.config().require_confirmation_for_network && !approvals.network {
+            approvals.network = confirm("Allow network access for autonomous mode?", auto_yes)?;
+        }
+        let (inferred_host, inferred_port) = infer_host_port_from_args(&action.args);
+        let host = action
+            .host
+            .clone()
+            .or(inferred_host)
+            .unwrap_or_else(|| "unknown-host".to_string());
+        let port = action.port.or(inferred_port);
+        if let Err(err) = policy.ensure_network_allowed(*approvals, &host, port, false) {
+            let err_text = err.to_string();
+            store.add_action(NewAction {
+                session_id,
+                action_type: "chat-agent-run",
+                command: &preview,
+                target: Some(&host),
+                status: "blocked",
+                stdout: None,
+                stderr: Some(&err_text),
+                metadata: Some(
+                    &json!({"step": step, "risk": risk.as_str(), "network": true, "host": host, "port": port}),
+                ),
+            })?;
+            if output_mode == OutputMode::Text {
+                println!("[agent-action] blocked: {}", err_text);
+            }
+            return Ok(format!("blocked: {}", err_text));
+        }
+    }
+
+    let max_timeout = policy.config().max_runtime_per_action_secs.max(1);
+    let timeout_secs = action
+        .timeout_secs
+        .filter(|v| *v > 0)
+        .map(|v| v.min(max_timeout))
+        .unwrap_or(max_timeout);
+
+    let run = with_terminal_spinner(
+        args.show_actions && output_mode == OutputMode::Text,
+        "[agent-action] running",
+        || {
+            tools.run(ToolRunRequest {
+                program: program.to_string(),
+                args: action.args.clone(),
+                cwd: Some(cwd.to_path_buf()),
+                timeout_secs: Some(timeout_secs),
+            })
+        },
+    );
+
+    match run {
+        Ok(res) => {
+            let meta = json!({
+                "step": step,
+                "risk": risk.as_str(),
+                "network": action.requires_network,
+                "exit_code": res.exit_code,
+                "duration_ms": res.duration_ms,
+                "timed_out": res.timed_out,
+                "timeout_secs": timeout_secs,
+            });
+            store.add_action(NewAction {
+                session_id,
+                action_type: "chat-agent-run",
+                command: &res.command_preview,
+                target: action.host.as_deref(),
+                status: &res.status,
+                stdout: Some(&res.stdout),
+                stderr: Some(&res.stderr),
+                metadata: Some(&meta),
+            })?;
+
+            if output_mode == OutputMode::Text {
+                if !res.stdout.trim().is_empty() {
+                    println!("{}", res.stdout);
+                }
+                if !res.stderr.trim().is_empty() {
+                    eprintln!("{}", res.stderr);
+                }
+            }
+
+            let matched_flags =
+                extract_flags_from_text(&format!("{}\n{}", res.stdout, res.stderr), flag_prefix);
+            if !matched_flags.is_empty() {
+                let joined = matched_flags.join(", ");
+                let _ = store.add_note(session_id, &format!("candidate-flags: {}", joined));
+                if output_mode == OutputMode::Text {
+                    println!("[agent-flag] {}", joined);
+                }
+            }
+
+            let mut observation = format!(
+                "{} -> status={} exit={:?} stdout={} stderr={}",
+                res.command_preview,
+                res.status,
+                res.exit_code,
+                truncate_for_prompt(&res.stdout, 1000),
+                truncate_for_prompt(&res.stderr, 500)
+            );
+            if !matched_flags.is_empty() {
+                observation.push_str(&format!(" candidate_flags={}", matched_flags.join(",")));
+            }
+            Ok(observation)
+        }
+        Err(err) => {
+            let err_text = err.to_string();
+            store.add_action(NewAction {
+                session_id,
+                action_type: "chat-agent-run",
+                command: &preview,
+                target: action.host.as_deref(),
+                status: "error",
+                stdout: None,
+                stderr: Some(&err_text),
+                metadata: Some(&json!({"step": step, "risk": risk.as_str(), "network": action.requires_network})),
+            })?;
+            if output_mode == OutputMode::Text {
+                eprintln!("[agent-action] error: {}", err_text);
+            }
+            Ok(format!("error: {}", err_text))
+        }
+    }
+}
+
+fn is_failure_observation(observation: &str) -> bool {
+    let lower = observation.to_ascii_lowercase();
+    lower.starts_with("blocked:")
+        || lower.starts_with("error:")
+        || lower.contains("status=error")
+        || lower.contains("status=timeout")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_autonomous_concept_research(
+    goal: &str,
+    observations: &[String],
+    args: &ChatArgs,
+    session_id: &str,
+    cwd: &Path,
+    store: &StateStore,
+    policy: &PolicyEngine,
+    web_researcher: &mut Option<WebResearcher>,
+    approvals: &mut Approvals,
+    output_mode: OutputMode,
+    auto_yes: bool,
+) -> Result<String> {
+    let queries = build_concept_queries(goal, observations);
+    let mut context = String::new();
+
+    for query in queries.into_iter().take(2) {
+        let local_hits = search_local(&query, cwd, store, Some(session_id), 2).unwrap_or_default();
+        let mut web_hits = Vec::new();
+
+        if args.web {
+            if let Some(researcher) = web_researcher.as_mut() {
+                if policy.config().require_confirmation_for_network && !approvals.network {
+                    approvals.network = confirm(
+                        "Allow autonomous web concept research (docs/public references only)?",
+                        auto_yes,
+                    )?;
+                }
+                if policy
+                    .ensure_network_allowed(*approvals, "public-web", None, true)
+                    .is_ok()
+                {
+                    web_hits = researcher.search(&query, 2, store).unwrap_or_default();
+                }
+            }
+        }
+
+        if args.show_actions && output_mode == OutputMode::Text {
+            println!(
+                "[agent-research] query='{}' local_hits={} web_hits={}",
+                query,
+                local_hits.len(),
+                web_hits.len()
+            );
+        }
+
+        for hit in local_hits.iter().chain(web_hits.iter()) {
+            let _ = store.add_citation(
+                session_id,
+                &hit.citation.source_type,
+                &hit.citation.source,
+                hit.citation.locator.as_deref(),
+                &hit.citation.snippet,
+            );
+        }
+
+        if !local_hits.is_empty() || !web_hits.is_empty() {
+            context.push_str(&format!("query={}\n", query));
+            for hit in local_hits.iter().chain(web_hits.iter()).take(4) {
+                context.push_str(&format!(
+                    "- {} :: {}\n",
+                    hit.citation.source,
+                    hit.snippet.replace('\n', " ")
+                ));
+            }
+        }
+    }
+
+    if !context.trim().is_empty() {
+        let _ = store.add_note(
+            session_id,
+            &format!(
+                "agent-concept-research: {}",
+                truncate_for_prompt(&context, 700)
+            ),
+        );
+    }
+
+    Ok(context)
+}
+
+fn build_concept_queries(goal: &str, observations: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let goal = goal.trim();
+    if !goal.is_empty() {
+        out.push(goal.to_string());
+        out.push(format!("{goal} ctf writeup strategy"));
+    }
+
+    if let Some(last) = observations.last() {
+        let fragment = last
+            .split_whitespace()
+            .filter(|t| {
+                t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./:".contains(c))
+            })
+            .take(10)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !fragment.is_empty() {
+            out.push(format!("{goal} {}", fragment));
+        }
+    }
+
+    let mut dedup = HashSet::new();
+    out.into_iter()
+        .filter(|q| dedup.insert(q.clone()))
+        .collect()
+}
+
+fn build_agent_prompt(
+    goal: &str,
+    cwd: &Path,
+    local_context: &str,
+    concept_context: &str,
+    observations: &[String],
+    available_tools: &[String],
+    step: usize,
+    max_steps: usize,
+    stuck_score: usize,
+    flag_prefix: Option<&str>,
+) -> String {
+    let mut prompt = format!(
+        "Goal:\n{}\n\nCurrent working directory:\n{}\n\nStep: {}/{}\n",
+        goal,
+        cwd.display(),
+        step,
+        max_steps
+    );
+
+    if !local_context.trim().is_empty() {
+        prompt.push_str("\nRelevant local context:\n");
+        prompt.push_str(local_context);
+    }
+
+    if !observations.is_empty() {
+        prompt.push_str("\nPrior observations:\n");
+        for obs in observations.iter().rev().take(6).rev() {
+            prompt.push_str("- ");
+            prompt.push_str(obs);
+            prompt.push('\n');
+        }
+    }
+
+    if !available_tools.is_empty() {
+        prompt.push_str("\nAvailable tools (installed):\n");
+        prompt.push_str(&available_tools.join(", "));
+        prompt.push('\n');
+    }
+
+    if let Some(prefix) = flag_prefix {
+        prompt.push_str(&format!(
+            "\nExpected flag prefix:\n{}\nTreat matching outputs as high-priority candidates.\n",
+            prefix
+        ));
+    }
+
+    if !concept_context.trim().is_empty() {
+        prompt.push_str("\nConcept research context:\n");
+        prompt.push_str(concept_context);
+    }
+
+    if stuck_score > 0 {
+        prompt.push_str(&format!(
+            "\nStuck indicator: {} recent failed/blocked attempts.\n",
+            stuck_score
+        ));
+    }
+
+    prompt.push_str(
+        "\nReturn exactly one raw JSON object with this schema:\n\
+{\"mode\":\"act|respond|done\",\"message\":\"short user-facing text\",\"action\":{\"program\":\"command\",\"args\":[\"arg1\"],\"reason\":\"why this action\",\"risk\":\"low|medium|high\",\"requires_network\":false,\"host\":null,\"port\":null,\"timeout_secs\":60}}\n\n\
+Rules:\n\
+- Use mode=\"act\" only when an action is needed.\n\
+- Propose one action at a time.\n\
+- Prefer deterministic local commands.\n\
+- Use available tools autonomously; do not wait for explicit tool names from user.\n\
+- Observe behavior from each command result and adapt the next action to that behavior.\n\
+- If recent attempts failed, switch strategy family and do not repeat failed commands.\n\
+- Think outside the obvious path: alternative tools, alternate assumptions, and verification steps.\n\
+- Never propose destructive commands.\n\
+- Output raw JSON only (no markdown or prose outside JSON).\n",
+    );
+
+    prompt
+}
+
+fn parse_agent_decision(raw: &str) -> Option<AgentDecision> {
+    let mut candidates = Vec::new();
+    candidates.push(raw.trim().to_string());
+
+    if let Some(block) = extract_fenced_json(raw) {
+        candidates.push(block);
+    }
+
+    if let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}'))
+        && start < end
+    {
+        candidates.push(raw[start..=end].trim().to_string());
+    }
+
+    for candidate in candidates {
+        if candidate.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<AgentDecision>(&candidate) {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+fn extract_fenced_json(raw: &str) -> Option<String> {
+    let start = raw.find("```")?;
+    let rest = &raw[start + 3..];
+    let end = rest.find("```")?;
+    let mut block = rest[..end].trim().to_string();
+    let lower = block.to_ascii_lowercase();
+    if lower.starts_with("json") {
+        block = block[4..].trim().to_string();
+    }
+    if block.is_empty() { None } else { Some(block) }
+}
+
+fn action_needs_confirmation(
+    mode: ChatApprovalMode,
+    risk: AgentRisk,
+    requires_network: bool,
+) -> bool {
+    match mode {
+        ChatApprovalMode::All => true,
+        ChatApprovalMode::Risky => requires_network || !matches!(risk, AgentRisk::Low),
+    }
+}
+
+fn classify_action_risk(action: &AgentAction) -> AgentRisk {
+    if let Some(parsed) = AgentRisk::from_label(&action.risk) {
+        return parsed;
+    }
+
+    let program = action.program.to_ascii_lowercase();
+    let joined = format!("{} {}", program, action.args.join(" ").to_ascii_lowercase());
+
+    let high_risk = ["rm", "mkfs", "dd", "shutdown", "reboot", "poweroff", "halt"];
+    if high_risk.iter().any(|x| program == *x) || joined.contains("rm -rf") {
+        return AgentRisk::High;
+    }
+
+    let medium_risk = [
+        "curl", "wget", "nc", "ncat", "nmap", "ffuf", "sqlmap", "nikto", "http", "ssh", "scp",
+        "ftp", "telnet",
+    ];
+    if action.requires_network || medium_risk.iter().any(|x| program == *x) {
+        return AgentRisk::Medium;
+    }
+
+    AgentRisk::Low
+}
+
+fn infer_host_port_from_args(args: &[String]) -> (Option<String>, Option<u16>) {
+    for arg in args {
+        if let Ok(url) = url::Url::parse(arg) {
+            let host = url.host_str().map(ToString::to_string);
+            let port = url.port_or_known_default();
+            if host.is_some() {
+                return (host, port);
+            }
+        }
+    }
+    (None, None)
+}
+
+fn extract_flag_prefix_hint(text: &str) -> Option<String> {
+    let prefixed_flag = Regex::new(r"(?i)\b([a-z][a-z0-9_-]{1,24})\{").expect("prefix regex");
+    if let Some(cap) = prefixed_flag.captures(text)
+        && let Some(m) = cap.get(1)
+    {
+        return Some(m.as_str().to_string());
+    }
+
+    let stated_prefix = Regex::new(
+        r"(?i)\b(?:flag\s*prefix|prefix|flag\s*format)\b\s*(?:is|=|:)?\s*([a-z][a-z0-9_-]{1,24})\b",
+    )
+    .expect("stated prefix regex");
+    if let Some(cap) = stated_prefix.captures(text)
+        && let Some(m) = cap.get(1)
+    {
+        let candidate = m.as_str().to_ascii_lowercase();
+        if !matches!(
+            candidate.as_str(),
+            "flag" | "prefix" | "format" | "is" | "the"
+        ) {
+            return Some(m.as_str().to_string());
+        }
+    }
+
+    None
+}
+
+fn extract_flags_from_text(text: &str, flag_prefix: Option<&str>) -> Vec<String> {
+    let generic_re =
+        Regex::new(r"(?i)([a-z0-9_\-]{2,16}\{[^\n\r\}]{1,180}\})").expect("flag regex");
+
+    let mut out = BTreeMap::new();
+    if let Some(prefix) = flag_prefix
+        && !prefix.trim().is_empty()
+    {
+        let escaped = regex::escape(prefix.trim());
+        let pattern = format!(r"(?i)({}\{{[^\n\r\}}]{{1,220}}\}})", escaped);
+        if let Ok(prefixed_re) = Regex::new(&pattern) {
+            for cap in prefixed_re.captures_iter(text) {
+                if let Some(m) = cap.get(1) {
+                    out.insert(m.as_str().to_ascii_lowercase(), m.as_str().to_string());
+                }
+            }
+        }
+    }
+
+    for cap in generic_re.captures_iter(text) {
+        if let Some(m) = cap.get(1) {
+            out.insert(m.as_str().to_ascii_lowercase(), m.as_str().to_string());
+        }
+    }
+    out.into_values().collect()
+}
+
+fn truncate_for_prompt(input: &str, max_chars: usize) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.len() <= max_chars {
+        return trimmed.to_string();
+    }
+    format!("{}...[truncated]", &trimmed[..max_chars])
+}
+
+fn with_terminal_spinner<T, F>(enabled: bool, label: &str, op: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    if !enabled {
+        return op();
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_bg = Arc::clone(&done);
+    let label = label.to_string();
+
+    let handle = thread::spawn(move || {
+        let frames = ["|", "/", "-", "\\"];
+        let mut idx = 0usize;
+        while !done_bg.load(Ordering::Relaxed) {
+            print!("\r{} {}", label, frames[idx % frames.len()]);
+            let _ = io::stdout().flush();
+            idx = idx.wrapping_add(1);
+            thread::sleep(Duration::from_millis(90));
+        }
+        print!("\r{} done    \n", label);
+        let _ = io::stdout().flush();
+    });
+
+    let result = op();
+    done.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+    result
 }
 
 fn configure_provider(cfg: &mut AppConfig, args: &ProvidersConfigureArgs) -> Result<()> {
@@ -1421,10 +2751,37 @@ fn configure_provider(cfg: &mut AppConfig, args: &ProvidersConfigureArgs) -> Res
                 return Ok(());
             }
 
+            if let Some(p) = cfg
+                .providers
+                .generic_http
+                .iter_mut()
+                .find(|p| p.name.eq_ignore_ascii_case(other))
+            {
+                if let Some(v) = args.api_key.clone() {
+                    p.api_key = Some(v);
+                }
+                if let Some(v) = args.api_key_env.clone() {
+                    p.api_key_env = v;
+                }
+                if let Some(v) = args.model.clone() {
+                    p.default_model = v;
+                }
+                if let Some(v) = args.base_url.clone() {
+                    p.base_url = v;
+                }
+                if args.enable {
+                    p.enabled = true;
+                }
+                if args.disable {
+                    p.enabled = false;
+                }
+                return Ok(());
+            }
+
             let compat = args.compat.clone().unwrap_or(ProviderCompat::Openai);
             let base_url = args.base_url.clone().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "unknown provider '{other}'; pass --base-url and optionally --compat openai|anthropic"
+                    "unknown provider '{other}'; pass --base-url and optionally --compat openai|anthropic|generic"
                 )
             })?;
             let api_key_env = args.api_key_env.clone().unwrap_or_else(|| {
@@ -1432,10 +2789,8 @@ fn configure_provider(cfg: &mut AppConfig, args: &ProvidersConfigureArgs) -> Res
             });
 
             match compat {
-                ProviderCompat::Openai => cfg
-                    .providers
-                    .custom_openai_compatible
-                    .push(crate::config::NamedOpenAiCompatProvider {
+                ProviderCompat::Openai => cfg.providers.custom_openai_compatible.push(
+                    crate::config::NamedOpenAiCompatProvider {
                         name: other.to_string(),
                         enabled: !args.disable,
                         base_url,
@@ -1445,21 +2800,38 @@ fn configure_provider(cfg: &mut AppConfig, args: &ProvidersConfigureArgs) -> Res
                             .model
                             .clone()
                             .unwrap_or_else(|| "gpt-4.1-mini".to_string()),
-                    }),
-                ProviderCompat::Anthropic => cfg
-                    .providers
-                    .anthropic_compatible
-                    .push(crate::config::AnthropicProvider {
-                        name: other.to_string(),
-                        enabled: !args.disable,
-                        base_url,
-                        api_key_env,
-                        api_key: args.api_key.clone(),
-                        default_model: args
-                            .model
-                            .clone()
-                            .unwrap_or_else(|| "claude-3-5-sonnet-latest".to_string()),
-                    }),
+                    },
+                ),
+                ProviderCompat::Anthropic => {
+                    cfg.providers
+                        .anthropic_compatible
+                        .push(crate::config::AnthropicProvider {
+                            name: other.to_string(),
+                            enabled: !args.disable,
+                            base_url,
+                            api_key_env,
+                            api_key: args.api_key.clone(),
+                            default_model: args
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| "claude-3-5-sonnet-latest".to_string()),
+                        })
+                }
+                ProviderCompat::Generic => {
+                    cfg.providers
+                        .generic_http
+                        .push(crate::config::GenericHttpProvider {
+                            name: other.to_string(),
+                            enabled: !args.disable,
+                            base_url,
+                            api_key_env,
+                            api_key: args.api_key.clone(),
+                            default_model: args
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| "generic-default".to_string()),
+                        })
+                }
             }
             Ok(())
         }
@@ -1502,6 +2874,43 @@ fn set_route(cfg: &mut AppConfig, route: RouteTask, provider: &str, model: Optio
     target.provider = provider.to_string();
     if model.is_some() {
         target.model = model;
+    }
+}
+
+fn bind_default_chat_routes(cfg: &mut AppConfig, provider: &str, model: Option<String>) {
+    let model_clone = model.clone();
+    if cfg
+        .model_routing
+        .reasoning
+        .provider
+        .eq_ignore_ascii_case("local")
+    {
+        cfg.model_routing.reasoning.provider = provider.to_string();
+        if model_clone.is_some() {
+            cfg.model_routing.reasoning.model = model_clone.clone();
+        }
+    }
+    if cfg
+        .model_routing
+        .coding
+        .provider
+        .eq_ignore_ascii_case("local")
+    {
+        cfg.model_routing.coding.provider = provider.to_string();
+        if model_clone.is_some() {
+            cfg.model_routing.coding.model = model_clone.clone();
+        }
+    }
+    if cfg
+        .model_routing
+        .summarization
+        .provider
+        .eq_ignore_ascii_case("local")
+    {
+        cfg.model_routing.summarization.provider = provider.to_string();
+        if model_clone.is_some() {
+            cfg.model_routing.summarization.model = model_clone;
+        }
     }
 }
 
@@ -1588,6 +2997,21 @@ fn redacted_provider_view(cfg: &AppConfig, provider: &str) -> serde_json::Value 
                     "api_key_configured": p.api_key.as_deref().is_some_and(|v| !v.is_empty()),
                     "default_model": p.default_model,
                 })
+            } else if let Some(p) = cfg
+                .providers
+                .generic_http
+                .iter()
+                .find(|x| x.name.eq_ignore_ascii_case(other))
+            {
+                json!({
+                    "provider": p.name,
+                    "compat": "generic",
+                    "enabled": p.enabled,
+                    "base_url": p.base_url,
+                    "api_key_env": p.api_key_env,
+                    "api_key_configured": p.api_key.as_deref().is_some_and(|v| !v.is_empty()),
+                    "default_model": p.default_model,
+                })
             } else {
                 json!({"provider": provider, "status": "unknown"})
             }
@@ -1626,6 +3050,7 @@ fn parse_compat(value: &str) -> Option<ProviderCompat> {
         "anthropic" | "anthropic-compatible" | "anthropic_compatible" => {
             Some(ProviderCompat::Anthropic)
         }
+        "generic" | "http" | "rest" => Some(ProviderCompat::Generic),
         _ => None,
     }
 }
@@ -1705,7 +3130,11 @@ fn ensure_session(store: &StateStore, session_id: Option<&str>, root: &Path) -> 
     }
 }
 
-fn ensure_session_label(store: &StateStore, session_id: Option<&str>, root_label: &str) -> Result<String> {
+fn ensure_session_label(
+    store: &StateStore,
+    session_id: Option<&str>,
+    root_label: &str,
+) -> Result<String> {
     match session_id {
         Some(id) => {
             if store.get_session(id)?.is_none() {
@@ -1732,7 +3161,11 @@ fn collect_challenge_paths(root: &Path, max: usize) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
 
-    for entry in walkdir::WalkDir::new(root).max_depth(3).into_iter().filter_map(Result::ok) {
+    for entry in walkdir::WalkDir::new(root)
+        .max_depth(3)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
         if out.len() >= max {
             break;
         }
@@ -1760,14 +3193,45 @@ fn parse_category(s: &str) -> Option<ChallengeCategory> {
         "crypto" => Some(ChallengeCategory::Crypto),
         "pwn" => Some(ChallengeCategory::Pwn),
         "rev" => Some(ChallengeCategory::Reverse),
+        "reverse" => Some(ChallengeCategory::Reverse),
         "web" => Some(ChallengeCategory::Web),
         "misc" => Some(ChallengeCategory::Misc),
         "forensics" => Some(ChallengeCategory::Forensics),
+        "forensic" => Some(ChallengeCategory::Forensics),
         "stego" => Some(ChallengeCategory::Stego),
         "osint" => Some(ChallengeCategory::Osint),
+        "mobile" => Some(ChallengeCategory::Mobile),
+        "hardware" => Some(ChallengeCategory::Hardware),
+        "blockchain" | "chain" => Some(ChallengeCategory::Blockchain),
+        "cloud" => Some(ChallengeCategory::Cloud),
+        "network" | "net" => Some(ChallengeCategory::Network),
+        "ai" | "ml" | "llm" => Some(ChallengeCategory::Ai),
         "unknown" => Some(ChallengeCategory::Unknown),
         _ => None,
     }
+}
+
+fn normalize_category_filter(raw: Option<&str>) -> Result<Option<String>> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+
+    let canonical = match normalized.as_str() {
+        "reverse" => "rev",
+        "forensic" => "forensics",
+        "chain" => "blockchain",
+        "net" => "network",
+        "ml" | "llm" => "ai",
+        _ => normalized.as_str(),
+    };
+    if parse_category(canonical).is_none() {
+        bail!("unsupported category '{}'", value.trim());
+    }
+    Ok(Some(canonical.to_string()))
 }
 
 fn emit<T: Serialize>(mode: OutputMode, payload: &T, text: &str) -> Result<()> {
@@ -1780,4 +3244,53 @@ fn emit<T: Serialize>(mode: OutputMode, payload: &T, text: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_agent_json_from_fenced_block() {
+        let raw = "```json\n{\"mode\":\"act\",\"message\":\"triage\",\"action\":{\"program\":\"rg\",\"args\":[\"-n\",\"flag\",\".\"],\"risk\":\"low\"}}\n```";
+        let parsed = parse_agent_decision(raw).expect("agent decision");
+        assert_eq!(parsed.mode, "act");
+        let action = parsed.action.expect("action");
+        assert_eq!(action.program, "rg");
+        assert_eq!(action.args, vec!["-n", "flag", "."]);
+    }
+
+    #[test]
+    fn classifies_high_risk_commands() {
+        let action = AgentAction {
+            program: "rm".to_string(),
+            args: vec!["-rf".to_string(), "/tmp/demo".to_string()],
+            reason: String::new(),
+            risk: String::new(),
+            requires_network: false,
+            host: None,
+            port: None,
+            timeout_secs: None,
+        };
+        assert_eq!(classify_action_risk(&action), AgentRisk::High);
+    }
+
+    #[test]
+    fn risky_mode_skips_prompt_for_low_risk_local_action() {
+        assert!(!action_needs_confirmation(
+            ChatApprovalMode::Risky,
+            AgentRisk::Low,
+            false
+        ));
+        assert!(action_needs_confirmation(
+            ChatApprovalMode::Risky,
+            AgentRisk::Medium,
+            false
+        ));
+        assert!(action_needs_confirmation(
+            ChatApprovalMode::Risky,
+            AgentRisk::Low,
+            true
+        ));
+    }
 }
