@@ -96,7 +96,7 @@ Non-interactive:
 
 ```bash
 0x0 setup --non-interactive --provider openai --api-key-env OPENAI_API_KEY --model gpt-4.1-mini
-0x0 setup --non-interactive --provider gemini --api-key-env GEMINI_API_KEY --model gemini-1.5-flash
+0x0 setup --non-interactive --provider gemini --api-key-env GEMINI_API_KEY --model gemini-2.5-flash
 ```
 
 For complete command/parameter coverage, see [Command Reference](COMMANDS.md).

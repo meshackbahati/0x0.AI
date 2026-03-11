@@ -107,6 +107,29 @@ These can be used before any command:
 - `--show-actions <true|false>` (default `true`)
 - `--max-turns <n>` (default `200`)
 
+Chat REPL slash commands:
+- `/help`
+- `/sessions`
+- `/resume <session-id>`
+- `/constraints`
+- `/provider` (list provider readiness including API-key checks)
+- `/provider <name>` (switch active provider if ready)
+- `/model` (show active provider/model)
+- `/model all` (fetch and list models for active provider API using configured provider `base_url`)
+- `/model <provider>` (switch active provider and clear model override)
+- `/model <model-id>` (set model override for current chat session)
+- `/model <provider>:<model-id>` (switch provider+model together for current session)
+- `/model default` (clear model override and use provider default)
+- `/run <command>`
+- `/ps`
+- `/ls`
+- `/pwd`
+- `/clean`
+- `/research <query>`
+- `/ask <prompt>`
+- `/auto <goal>`
+- `/exit`
+
 ### `note <session-id> <text...>`
 
 - `session-id`: target session.

@@ -29,7 +29,7 @@ impl GeminiProviderClient {
         Some(Self {
             api_key,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
-            default_model: cfg.default_model.clone(),
+            default_model: normalize_model_name(&cfg.default_model),
         })
     }
 }
@@ -82,10 +82,11 @@ impl Provider for GeminiProviderClient {
         req: &ProviderRequest,
         mut stream: Option<&mut dyn FnMut(&str)>,
     ) -> Result<ProviderResponse> {
-        let model = req
+        let requested_model = req
             .model_override
             .clone()
             .unwrap_or_else(|| self.default_model.clone());
+        let models_to_try = candidate_model_fallbacks(&requested_model);
 
         let prompt = if let Some(system) = &req.system {
             format!("System:\n{}\n\nUser:\n{}", system, req.prompt)
@@ -93,9 +94,75 @@ impl Provider for GeminiProviderClient {
             req.prompt.clone()
         };
 
-        if let Some(sink) = stream.as_mut()
-            && let Ok(text) = self.generate_streaming(req, &model, &prompt, *sink)
-        {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(req.timeout_secs))
+            .build()
+            .context("building gemini client")?;
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for model in models_to_try {
+            if let Some(sink) = stream.as_mut()
+                && let Ok(text) = self.generate_streaming(req, &model, &prompt, *sink)
+            {
+                return Ok(ProviderResponse {
+                    provider: "gemini".to_string(),
+                    model,
+                    prompt_tokens_est: estimate_tokens(&req.prompt),
+                    completion_tokens_est: estimate_tokens(&text),
+                    text,
+                });
+            }
+
+            let endpoint = format!(
+                "{}/models/{}:generateContent?key={}",
+                self.base_url, model, self.api_key
+            );
+
+            let body = json!({
+                "contents": [
+                    { "parts": [ { "text": prompt } ] }
+                ],
+                "generationConfig": {
+                    "temperature": req.temperature,
+                    "maxOutputTokens": req.max_tokens
+                }
+            });
+
+            let response = match client.post(&endpoint).json(&body).send() {
+                Ok(v) => v,
+                Err(err) => {
+                    last_err = Some(anyhow::Error::new(err).context("sending gemini request"));
+                    break;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().unwrap_or_default();
+                if status == 404 {
+                    last_err = Some(anyhow::anyhow!(
+                        "gemini model '{}' unavailable (HTTP 404)",
+                        model
+                    ));
+                    continue;
+                }
+                bail!(
+                    "gemini returned HTTP {} for model '{}': {}",
+                    status,
+                    model,
+                    truncate_http_error(&body)
+                );
+            }
+
+            let value: Value = response.json().context("parsing gemini json")?;
+            let text = extract_text(&value)?;
+
+            if let Some(sink) = stream.as_mut() {
+                for c in chunk_text(&text, 52) {
+                    sink(&c);
+                }
+            }
+
             return Ok(ProviderResponse {
                 provider: "gemini".to_string(),
                 model,
@@ -105,52 +172,7 @@ impl Provider for GeminiProviderClient {
             });
         }
 
-        let endpoint = format!(
-            "{}/models/{}:generateContent?key={}",
-            self.base_url, model, self.api_key
-        );
-
-        let body = json!({
-            "contents": [
-                { "parts": [ { "text": prompt } ] }
-            ],
-            "generationConfig": {
-                "temperature": req.temperature,
-                "maxOutputTokens": req.max_tokens
-            }
-        });
-
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(req.timeout_secs))
-            .build()
-            .context("building gemini client")?;
-
-        let response = client
-            .post(endpoint)
-            .json(&body)
-            .send()
-            .context("sending gemini request")?;
-
-        if !response.status().is_success() {
-            bail!("gemini returned HTTP {}", response.status().as_u16());
-        }
-
-        let value: Value = response.json().context("parsing gemini json")?;
-        let text = extract_text(&value)?;
-
-        if let Some(sink) = stream.as_mut() {
-            for c in chunk_text(&text, 52) {
-                sink(&c);
-            }
-        }
-
-        Ok(ProviderResponse {
-            provider: "gemini".to_string(),
-            model,
-            prompt_tokens_est: estimate_tokens(&req.prompt),
-            completion_tokens_est: estimate_tokens(&text),
-            text,
-        })
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("gemini request failed")))
     }
 }
 
@@ -225,6 +247,37 @@ impl GeminiProviderClient {
             bail!("stream returned empty text");
         }
         Ok(text)
+    }
+}
+
+fn normalize_model_name(model: &str) -> String {
+    let trimmed = model.trim();
+    trimmed.trim_start_matches("models/").trim().to_string()
+}
+
+fn candidate_model_fallbacks(primary: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let primary = normalize_model_name(primary);
+    if !primary.is_empty() {
+        out.push(primary);
+    }
+    for candidate in ["gemini-2.5-flash", "gemini-flash-latest"] {
+        if !out.iter().any(|m| m == candidate) {
+            out.push(candidate.to_string());
+        }
+    }
+    out
+}
+
+fn truncate_http_error(body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        return "(empty error body)".to_string();
+    }
+    if body.len() <= 240 {
+        body.to_string()
+    } else {
+        format!("{}...", &body[..240])
     }
 }
 

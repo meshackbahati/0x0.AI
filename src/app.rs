@@ -1206,6 +1206,43 @@ struct AgentAction {
     timeout_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct ChatProviderCandidate {
+    name: String,
+    enabled: bool,
+    key_present: bool,
+    loaded: bool,
+    key_hint: Option<String>,
+}
+
+impl ChatProviderCandidate {
+    fn ready(&self) -> bool {
+        self.name == "local" || (self.enabled && self.key_present && self.loaded)
+    }
+
+    fn reason(&self) -> String {
+        if self.name == "local" {
+            return "ready".to_string();
+        }
+        if !self.enabled {
+            return "disabled".to_string();
+        }
+        if !self.key_present {
+            return format!(
+                "missing API key{}",
+                self.key_hint
+                    .as_deref()
+                    .map(|v| format!(" (set env {})", v))
+                    .unwrap_or_default()
+            );
+        }
+        if !self.loaded {
+            return "not loaded in runtime".to_string();
+        }
+        "ready".to_string()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentRisk {
     Low,
@@ -1251,6 +1288,27 @@ fn cmd_chat(
     )?;
     let mut current_session_id = session_id;
     let mut flag_prefix: Option<String> = None;
+    let mut active_provider = args.provider.clone();
+    let mut active_model_override: Option<String> = None;
+    if let Some(p) = active_provider.as_deref() {
+        let candidates = chat_provider_candidates(runtime, providers);
+        if let Some(candidate) = find_chat_provider_candidate(&candidates, p) {
+            if !candidate.ready() {
+                println!(
+                    "Provider '{}' is not ready: {}. Falling back to task default provider.",
+                    candidate.name,
+                    candidate.reason()
+                );
+                active_provider = None;
+            }
+        } else {
+            println!(
+                "Provider '{}' is not recognized. Falling back to task default provider.",
+                p
+            );
+            active_provider = None;
+        }
+    }
 
     let mut approvals = Approvals {
         network: args.approve_network || auto_yes,
@@ -1304,6 +1362,8 @@ fn cmd_chat(
                 output_mode,
                 auto_yes,
                 flag_prefix.as_deref(),
+                active_provider.as_deref(),
+                active_model_override.as_deref(),
             )?
         } else {
             chat_turn(
@@ -1319,6 +1379,8 @@ fn cmd_chat(
                 &mut approvals,
                 output_mode,
                 auto_yes,
+                active_provider.as_deref(),
+                active_model_override.as_deref(),
             )?
         };
 
@@ -1374,6 +1436,166 @@ fn cmd_chat(
             print_chat_help(args.autonomous);
             continue;
         }
+        if let Some(rest) = line.strip_prefix("/provider") {
+            let arg = rest.trim();
+            let candidates = chat_provider_candidates(runtime, providers);
+            if arg.is_empty() {
+                println!("Provider status:");
+                for c in &candidates {
+                    let marker = if active_provider.as_deref() == Some(c.name.as_str()) {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    println!("[{}] {} => {}", marker, c.name, c.reason());
+                }
+                println!("Use: /provider <name>");
+                continue;
+            }
+
+            if let Some(c) = find_chat_provider_candidate(&candidates, arg) {
+                if c.ready() {
+                    active_provider = Some(c.name.clone());
+                    active_model_override = None;
+                    let _ = store.add_note(
+                        &current_session_id,
+                        &format!("provider-selected {}", c.name),
+                    );
+                    println!(
+                        "active provider set to '{}' (model override cleared)",
+                        c.name
+                    );
+                } else {
+                    println!("provider '{}' is not ready: {}", c.name, c.reason());
+                }
+            } else {
+                println!("unknown provider '{}'", arg);
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/model") {
+            let arg = rest.trim();
+            if arg.is_empty() {
+                let resolved = active_provider
+                    .clone()
+                    .unwrap_or_else(|| providers.provider_for_task(TaskType::Reasoning));
+                let model_label = active_model_override
+                    .as_deref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "(provider default)".to_string());
+                println!("active provider={} model={}", resolved, model_label);
+                continue;
+            }
+            if arg.eq_ignore_ascii_case("all") {
+                let resolved = active_provider
+                    .clone()
+                    .unwrap_or_else(|| providers.provider_for_task(TaskType::Reasoning));
+                if !providers
+                    .available_provider_names()
+                    .iter()
+                    .any(|p| p == &resolved)
+                {
+                    println!(
+                        "Provider '{}' is not available in current config/runtime.",
+                        resolved
+                    );
+                    continue;
+                }
+                if resolved != "local" {
+                    if runtime.config.safety.require_confirmation_for_network && !approvals.network
+                    {
+                        approvals.network = confirm(
+                            "Allow network access to provider APIs for model listing?",
+                            auto_yes,
+                        )?;
+                    }
+                    policy.ensure_network_allowed(approvals, "provider-apis", None, true)?;
+                }
+                let listing = providers.list_models(Some(&resolved))?;
+                let models = listing.get(&resolved).cloned().unwrap_or_default();
+                if models.is_empty() {
+                    println!("No models returned for provider '{}'.", resolved);
+                } else {
+                    println!("Models for '{}':", resolved);
+                    for m in models {
+                        println!("- {}", m);
+                    }
+                }
+                let _ = store.add_note(
+                    &current_session_id,
+                    &format!("model-list provider={}", resolved),
+                );
+                continue;
+            }
+
+            if let Some((provider_name, model_name)) = arg.split_once(':') {
+                let provider = provider_name.trim();
+                let model = model_name.trim();
+                if provider.is_empty() || model.is_empty() {
+                    println!(
+                        "Usage: /model <model-id> | /model all | /model <provider>:<model-id>"
+                    );
+                    continue;
+                }
+                let candidates = chat_provider_candidates(runtime, providers);
+                if let Some(c) = find_chat_provider_candidate(&candidates, provider) {
+                    if c.ready() {
+                        active_provider = Some(c.name.clone());
+                        active_model_override = Some(model.to_string());
+                        let _ = store.add_note(
+                            &current_session_id,
+                            &format!("model-selected provider={} model={}", c.name, model),
+                        );
+                        println!("model override set: provider={} model={}", c.name, model);
+                    } else {
+                        println!("provider '{}' is not ready: {}", c.name, c.reason());
+                    }
+                } else {
+                    println!("unknown provider '{}'", provider);
+                }
+                continue;
+            }
+
+            let candidates = chat_provider_candidates(runtime, providers);
+            if let Some(c) = find_chat_provider_candidate(&candidates, arg) {
+                if c.ready() {
+                    active_provider = Some(c.name.clone());
+                    active_model_override = None;
+                    let _ = store.add_note(
+                        &current_session_id,
+                        &format!("provider-selected {}", c.name),
+                    );
+                    println!(
+                        "active provider set to '{}' (model override cleared)",
+                        c.name
+                    );
+                } else {
+                    println!("provider '{}' is not ready: {}", c.name, c.reason());
+                }
+                continue;
+            }
+
+            if matches!(
+                arg.to_ascii_lowercase().as_str(),
+                "none" | "default" | "reset" | "clear"
+            ) {
+                active_model_override = None;
+                let _ = store.add_note(&current_session_id, "model-selected: provider default");
+                println!("model override cleared; using provider default");
+                continue;
+            }
+
+            active_model_override = Some(arg.to_string());
+            let resolved = active_provider
+                .clone()
+                .unwrap_or_else(|| providers.provider_for_task(TaskType::Reasoning));
+            let _ = store.add_note(
+                &current_session_id,
+                &format!("model-selected provider={} model={}", resolved, arg),
+            );
+            println!("model override set: provider={} model={}", resolved, arg);
+            continue;
+        }
         if line == "/sessions" {
             let sessions = store.list_sessions(10)?;
             if sessions.is_empty() {
@@ -1426,6 +1648,8 @@ fn cmd_chat(
                 &mut approvals,
                 OutputMode::Text,
                 auto_yes,
+                active_provider.as_deref(),
+                active_model_override.as_deref(),
             )?;
             continue;
         }
@@ -1443,6 +1667,8 @@ fn cmd_chat(
                 &mut approvals,
                 OutputMode::Text,
                 auto_yes,
+                active_provider.as_deref(),
+                active_model_override.as_deref(),
             )?;
             continue;
         }
@@ -1460,6 +1686,8 @@ fn cmd_chat(
                 &mut approvals,
                 OutputMode::Text,
                 auto_yes,
+                active_provider.as_deref(),
+                active_model_override.as_deref(),
             )?;
             continue;
         }
@@ -1477,6 +1705,8 @@ fn cmd_chat(
                 &mut approvals,
                 OutputMode::Text,
                 auto_yes,
+                active_provider.as_deref(),
+                active_model_override.as_deref(),
             )?;
             continue;
         }
@@ -1495,6 +1725,8 @@ fn cmd_chat(
                 OutputMode::Text,
                 auto_yes,
                 flag_prefix.as_deref(),
+                active_provider.as_deref(),
+                active_model_override.as_deref(),
             )?;
             continue;
         }
@@ -1514,6 +1746,8 @@ fn cmd_chat(
                 OutputMode::Text,
                 auto_yes,
                 flag_prefix.as_deref(),
+                active_provider.as_deref(),
+                active_model_override.as_deref(),
             )?
         } else {
             chat_turn(
@@ -1529,6 +1763,8 @@ fn cmd_chat(
                 &mut approvals,
                 OutputMode::Text,
                 auto_yes,
+                active_provider.as_deref(),
+                active_model_override.as_deref(),
             )?
         };
     }
@@ -1542,6 +1778,10 @@ fn print_chat_help(autonomous_default: bool) {
     println!("/sessions                list recent session IDs");
     println!("/resume <session-id>     switch chat to an existing session");
     println!("/constraints             show active safety constraints");
+    println!("/provider [name]         list providers or switch provider if ready");
+    println!(
+        "/model [all|<provider>|<id>|<provider>:<id>] show/switch model or list provider models"
+    );
     println!("/run <command>           execute local command through policy wrapper");
     println!("/ps                      shortcut for /run ps aux");
     println!("/ls                      shortcut for /run ls -la");
@@ -1598,6 +1838,131 @@ fn print_chat_constraints(runtime: &RuntimeConfig, args: &ChatArgs, approvals: &
     );
 }
 
+fn chat_provider_candidates(
+    runtime: &RuntimeConfig,
+    providers: &ProviderManager,
+) -> Vec<ChatProviderCandidate> {
+    let loaded: HashSet<String> = providers.available_provider_names().into_iter().collect();
+    let mut out = BTreeMap::<String, ChatProviderCandidate>::new();
+
+    out.insert(
+        "local".to_string(),
+        ChatProviderCandidate {
+            name: "local".to_string(),
+            enabled: true,
+            key_present: true,
+            loaded: loaded.contains("local"),
+            key_hint: None,
+        },
+    );
+
+    let insert_openai_like =
+        |out: &mut BTreeMap<String, ChatProviderCandidate>,
+         name: &str,
+         cfg: &crate::config::OpenAiCompatProvider| {
+            out.insert(
+                name.to_string(),
+                ChatProviderCandidate {
+                    name: name.to_string(),
+                    enabled: cfg.enabled,
+                    key_present: provider_key_present(cfg.api_key.as_deref(), &cfg.api_key_env),
+                    loaded: loaded.contains(name),
+                    key_hint: Some(cfg.api_key_env.clone()),
+                },
+            );
+        };
+
+    let cfg = &runtime.config.providers;
+    insert_openai_like(&mut out, "openai", &cfg.openai);
+    insert_openai_like(&mut out, "openrouter", &cfg.openrouter);
+    insert_openai_like(&mut out, "together", &cfg.together);
+    insert_openai_like(&mut out, "moonshot", &cfg.moonshot);
+
+    out.insert(
+        "anthropic".to_string(),
+        ChatProviderCandidate {
+            name: "anthropic".to_string(),
+            enabled: cfg.anthropic.enabled,
+            key_present: provider_key_present(
+                cfg.anthropic.api_key.as_deref(),
+                &cfg.anthropic.api_key_env,
+            ),
+            loaded: loaded.contains("anthropic"),
+            key_hint: Some(cfg.anthropic.api_key_env.clone()),
+        },
+    );
+
+    out.insert(
+        "gemini".to_string(),
+        ChatProviderCandidate {
+            name: "gemini".to_string(),
+            enabled: cfg.gemini.enabled,
+            key_present: provider_key_present(
+                cfg.gemini.api_key.as_deref(),
+                &cfg.gemini.api_key_env,
+            ),
+            loaded: loaded.contains("gemini"),
+            key_hint: Some(cfg.gemini.api_key_env.clone()),
+        },
+    );
+
+    for p in &cfg.anthropic_compatible {
+        out.insert(
+            p.name.clone(),
+            ChatProviderCandidate {
+                name: p.name.clone(),
+                enabled: p.enabled,
+                key_present: provider_key_present(p.api_key.as_deref(), &p.api_key_env),
+                loaded: loaded.contains(&p.name),
+                key_hint: Some(p.api_key_env.clone()),
+            },
+        );
+    }
+
+    for p in &cfg.custom_openai_compatible {
+        out.insert(
+            p.name.clone(),
+            ChatProviderCandidate {
+                name: p.name.clone(),
+                enabled: p.enabled,
+                key_present: provider_key_present(p.api_key.as_deref(), &p.api_key_env),
+                loaded: loaded.contains(&p.name),
+                key_hint: Some(p.api_key_env.clone()),
+            },
+        );
+    }
+
+    for p in &cfg.generic_http {
+        out.insert(
+            p.name.clone(),
+            ChatProviderCandidate {
+                name: p.name.clone(),
+                enabled: p.enabled,
+                key_present: provider_key_present(p.api_key.as_deref(), &p.api_key_env),
+                loaded: loaded.contains(&p.name),
+                key_hint: Some(p.api_key_env.clone()),
+            },
+        );
+    }
+
+    out.into_values().collect()
+}
+
+fn provider_key_present(api_key: Option<&str>, api_key_env: &str) -> bool {
+    api_key.is_some_and(|v| !v.trim().is_empty())
+        || std::env::var(api_key_env)
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+}
+
+fn find_chat_provider_candidate<'a>(
+    candidates: &'a [ChatProviderCandidate],
+    name: &str,
+) -> Option<&'a ChatProviderCandidate> {
+    let n = name.trim().to_ascii_lowercase();
+    candidates.iter().find(|c| c.name.eq_ignore_ascii_case(&n))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn chat_turn(
     line: &str,
@@ -1612,6 +1977,8 @@ fn chat_turn(
     approvals: &mut Approvals,
     output_mode: OutputMode,
     auto_yes: bool,
+    provider_override: Option<&str>,
+    model_override: Option<&str>,
 ) -> Result<String> {
     let _ = store.add_note(session_id, &format!("user: {}", line));
 
@@ -1746,18 +2113,18 @@ fn chat_turn(
         max_tokens: 600,
         temperature: 0.2,
         timeout_secs: 45,
-        model_override: None,
+        model_override: model_override.map(ToString::to_string),
     };
 
     if args.show_actions && output_mode == OutputMode::Text {
-        let provider_name = args
-            .provider
+        let provider_name = provider_override
+            .map(ToString::to_string)
             .clone()
             .unwrap_or_else(|| providers.provider_for_task(TaskType::Reasoning));
         println!("[action] provider-call provider={provider_name}");
     }
 
-    let response = if let Some(p) = &args.provider {
+    let response = if let Some(p) = provider_override {
         providers.call_with_provider(
             p,
             req,
@@ -1835,6 +2202,8 @@ fn autonomous_chat_turn(
     output_mode: OutputMode,
     auto_yes: bool,
     flag_prefix: Option<&str>,
+    provider_override: Option<&str>,
+    model_override: Option<&str>,
 ) -> Result<String> {
     let goal = goal.trim();
     if goal.is_empty() {
@@ -1886,8 +2255,8 @@ fn autonomous_chat_turn(
             flag_prefix,
         );
         if args.show_actions && output_mode == OutputMode::Text {
-            let provider_name = args
-                .provider
+            let provider_name = provider_override
+                .map(ToString::to_string)
                 .clone()
                 .unwrap_or_else(|| providers.provider_for_task(TaskType::Reasoning));
             println!("[agent] step={step} provider={provider_name}");
@@ -1902,14 +2271,14 @@ fn autonomous_chat_turn(
             max_tokens: 700,
             temperature: 0.1,
             timeout_secs: 60,
-            model_override: None,
+            model_override: model_override.map(ToString::to_string),
         };
 
         let response = with_terminal_spinner(
             args.show_actions && output_mode == OutputMode::Text,
             "[agent] thinking",
             || {
-                if let Some(p) = &args.provider {
+                if let Some(p) = provider_override {
                     providers.call_with_provider(p, req, None)
                 } else {
                     providers.call(req, None)
@@ -1939,11 +2308,29 @@ fn autonomous_chat_turn(
         let decision = match parse_agent_decision(&raw_text) {
             Some(d) => d,
             None => {
-                if output_mode == OutputMode::Text {
-                    println!("{}", raw_text);
+                if let Some(fallback) = synthesize_autonomous_fallback(
+                    goal,
+                    step,
+                    args.max_agent_steps,
+                    &available_tools,
+                    &observations,
+                    &failed_actions,
+                    flag_prefix,
+                ) {
+                    if args.show_actions && output_mode == OutputMode::Text {
+                        println!(
+                            "[agent] fallback-plan active (provider returned non-JSON at step {})",
+                            step
+                        );
+                    }
+                    fallback
+                } else {
+                    if output_mode == OutputMode::Text {
+                        println!("{}", raw_text);
+                    }
+                    let _ = store.add_note(session_id, &format!("assistant: {}", raw_text));
+                    return Ok(raw_text);
                 }
-                let _ = store.add_note(session_id, &format!("assistant: {}", raw_text));
-                return Ok(raw_text);
             }
         };
 
@@ -2576,6 +2963,156 @@ fn extract_flag_prefix_hint(text: &str) -> Option<String> {
     }
 
     None
+}
+
+fn synthesize_autonomous_fallback(
+    goal: &str,
+    step: usize,
+    max_steps: usize,
+    available_tools: &[String],
+    observations: &[String],
+    failed_actions: &HashSet<String>,
+    flag_prefix: Option<&str>,
+) -> Option<AgentDecision> {
+    let goal_lc = goal.to_ascii_lowercase();
+    let has_tool = |name: &str| available_tools.iter().any(|t| t == name);
+
+    let mut candidates: Vec<AgentAction> = Vec::new();
+    candidates.push(AgentAction {
+        program: "ls".to_string(),
+        args: vec!["-la".to_string()],
+        reason: "Map current challenge directory structure".to_string(),
+        risk: "low".to_string(),
+        requires_network: false,
+        host: None,
+        port: None,
+        timeout_secs: Some(20),
+    });
+
+    if has_tool("rg") {
+        candidates.push(AgentAction {
+            program: "rg".to_string(),
+            args: vec!["--files".to_string(), ".".to_string()],
+            reason: "List candidate files quickly for challenge triage".to_string(),
+            risk: "low".to_string(),
+            requires_network: false,
+            host: None,
+            port: None,
+            timeout_secs: Some(20),
+        });
+    }
+
+    candidates.push(AgentAction {
+        program: "find".to_string(),
+        args: vec![
+            ".".to_string(),
+            "-maxdepth".to_string(),
+            "3".to_string(),
+            "-type".to_string(),
+            "f".to_string(),
+        ],
+        reason: "Enumerate challenge artifacts recursively".to_string(),
+        risk: "low".to_string(),
+        requires_network: false,
+        host: None,
+        port: None,
+        timeout_secs: Some(20),
+    });
+
+    if has_tool("rg") {
+        let pattern = if goal_lc.contains("rsa") || goal_lc.contains("crypto") {
+            "(rsa|n\\s*=|e\\s*=|c\\s*=|phi|mod|flag|ctf)"
+        } else if goal_lc.contains("pwn") || goal_lc.contains("overflow") {
+            "(flag|win|system\\(|gets\\(|strcpy|canary|rop)"
+        } else if goal_lc.contains("web") {
+            "(route|endpoint|auth|jwt|token|cookie|flag)"
+        } else if goal_lc.contains("rev") || goal_lc.contains("reverse") {
+            "(flag|check|verify|decrypt|xor|main)"
+        } else {
+            "(flag|ctf|secret|password|token)"
+        };
+        candidates.push(AgentAction {
+            program: "rg".to_string(),
+            args: vec!["-n".to_string(), pattern.to_string(), ".".to_string()],
+            reason: "Extract high-signal strings and flag clues from files".to_string(),
+            risk: "low".to_string(),
+            requires_network: false,
+            host: None,
+            port: None,
+            timeout_secs: Some(30),
+        });
+    }
+
+    if let Some(prefix) = flag_prefix
+        && has_tool("rg")
+        && !prefix.trim().is_empty()
+    {
+        let pattern = format!("{}\\{{", regex::escape(prefix.trim()));
+        candidates.push(AgentAction {
+            program: "rg".to_string(),
+            args: vec!["-n".to_string(), pattern, ".".to_string()],
+            reason: "Prioritize expected flag prefix candidates from user context".to_string(),
+            risk: "low".to_string(),
+            requires_network: false,
+            host: None,
+            port: None,
+            timeout_secs: Some(20),
+        });
+    }
+
+    if has_tool("python3") {
+        let script = r#"import os,stat,subprocess
+files=[]
+for b,_,ns in os.walk('.'):
+  for n in ns:
+    p=os.path.join(b,n); files.append(p)
+    if len(files)>=200: break
+  if len(files)>=200: break
+print('[behavior] files=',len(files))
+shown=0
+for p in files:
+  try:
+    st=os.stat(p)
+    if st.st_mode & stat.S_IXUSR:
+      for a in ([],['--help'],['-h']):
+        try:
+          r=subprocess.run([p]+a,capture_output=True,text=True,timeout=2)
+          o=(r.stdout or r.stderr or '').strip().replace('\n',' ')[:140]
+          print('[behavior]',p,'args=',a if a else ['<none>'],'code=',r.returncode,'out=',o)
+          shown+=1
+        except Exception as e:
+          print('[behavior]',p,'args=',a if a else ['<none>'],'err=',e)
+        if shown>=6: break
+      if shown>=6: break
+  except Exception:
+    pass
+"#;
+        candidates.push(AgentAction {
+            program: "python3".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            reason: "Observe executable behavior to guide next exploit hypothesis".to_string(),
+            risk: "low".to_string(),
+            requires_network: false,
+            host: None,
+            port: None,
+            timeout_secs: Some(45),
+        });
+    }
+
+    let next = candidates.into_iter().find(|a| {
+        let preview = shell_preview(&a.program, &a.args);
+        !failed_actions.contains(&preview) && !observations.iter().any(|o| o.contains(&preview))
+    });
+
+    let action = next?;
+    Some(AgentDecision {
+        mode: "act".to_string(),
+        message: format!(
+            "Using fallback autonomous planner (step {}/{}): {}",
+            step, max_steps, action.reason
+        ),
+        action: Some(action),
+    })
 }
 
 fn extract_flags_from_text(text: &str, flag_prefix: Option<&str>) -> Vec<String> {

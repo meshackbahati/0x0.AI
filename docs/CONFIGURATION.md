@@ -25,7 +25,7 @@ Examples:
 
 ```bash
 0x0 providers configure openai --enable --api-key-env OPENAI_API_KEY --model gpt-4.1-mini
-0x0 providers configure gemini --enable --api-key-env GEMINI_API_KEY --model gemini-1.5-flash
+0x0 providers configure gemini --enable --api-key-env GEMINI_API_KEY --model gemini-2.5-flash
 0x0 providers models --provider openai
 0x0 providers use --task reasoning --provider openai --model gpt-4.1
 0x0 providers test --provider gemini

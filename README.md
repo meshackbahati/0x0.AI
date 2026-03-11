@@ -146,6 +146,13 @@ Inside chat:
 - `/auto <goal>` to force autonomous loop for a single goal
 - `/sessions` to list recent session IDs
 - `/resume <session-id>` to continue a previous chat session
+- `/provider` to list provider readiness (enabled/key/runtime)
+- `/provider <name>` to switch provider interactively (checks API key presence)
+- `/model` to show active provider/model
+- `/model all` to fetch and list live models from current provider API
+- `/model <provider>` to switch active provider
+- `/model <model-id>` to switch model during the session
+- `/model <provider>:<model-id>` to switch provider and model together
 - `/run <command>` to execute one command manually
 - `/ps`, `/ls`, `/pwd` shortcuts for common terminal actions
 - `/clean` to clear the terminal
@@ -180,9 +187,9 @@ Gemini quick setup/test:
 
 ```bash
 export GEMINI_API_KEY="your_key_here"
-0x0 providers configure gemini --enable --api-key-env GEMINI_API_KEY --model gemini-1.5-flash
+0x0 providers configure gemini --enable --api-key-env GEMINI_API_KEY --model gemini-2.5-flash
 0x0 providers test --provider gemini
-0x0 providers use --task reasoning --provider gemini --model gemini-1.5-flash
+0x0 providers use --task reasoning --provider gemini --model gemini-2.5-flash
 ```
 
 List available provider models:

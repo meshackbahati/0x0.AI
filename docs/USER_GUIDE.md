@@ -43,7 +43,7 @@ Gemini setup (for your planned testing):
 
 ```bash
 export GEMINI_API_KEY="your_key_here"
-ox providers configure gemini --enable --api-key-env GEMINI_API_KEY --model gemini-1.5-flash
+ox providers configure gemini --enable --api-key-env GEMINI_API_KEY --model gemini-2.5-flash
 ox providers test --provider gemini
 ```
 
@@ -59,7 +59,7 @@ Route task mode to a selected provider/model:
 ox providers use --task reasoning --provider openai --model gpt-4.1
 ox providers use --task coding --provider openai --model gpt-4.1-mini
 ox providers use --task summarization --provider openai --model gpt-4.1-mini
-ox providers use --task reasoning --provider gemini --model gemini-1.5-flash
+ox providers use --task reasoning --provider gemini --model gemini-2.5-flash
 ```
 
 Custom API endpoint (OpenAI-compatible):
@@ -130,6 +130,13 @@ Inside chat:
 - `/ask <prompt>`: direct model response only
 - `/sessions`: list recent session IDs
 - `/resume <session-id>`: switch to an existing chat session
+- `/provider`: list provider readiness and API-key status
+- `/provider <name>`: switch provider interactively (only if provider is ready)
+- `/model`: show active provider/model
+- `/model all`: fetch and list models from the active provider API (using that provider's configured `base_url`)
+- `/model <provider>`: switch active provider
+- `/model <model-id>`: switch model for current chat session
+- `/model <provider>:<model-id>`: switch provider and model together
 - `/research <query>`: local + optional web research
 - `/run <command>`: executes local command via safety wrapper
 - `/ps`, `/ls`, `/pwd`: shell shortcuts

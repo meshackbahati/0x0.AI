@@ -23,7 +23,11 @@
 ```
 
 Inside chat:
+- `/provider`
+- `/provider gemini`
 - `/research <query>`
+- `/model all`
+- `/model gemini:gemini-2.5-flash`
 - `/run <local command>`
 - normal prompts to reason/code/explain
 - mention flag format naturally (example: `flag prefix is HTB`) so autonomous mode can prioritize matching candidates

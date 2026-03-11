@@ -269,7 +269,7 @@ impl Default for ProvidersConfig {
                 api_key_env: "GEMINI_API_KEY".to_string(),
                 api_key: None,
                 base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
-                default_model: "gemini-1.5-flash".to_string(),
+                default_model: "gemini-2.5-flash".to_string(),
             },
             anthropic_compatible: Vec::new(),
             custom_openai_compatible: Vec::new(),
@@ -403,7 +403,8 @@ pub fn load_runtime_config(explicit_config: Option<PathBuf>) -> Result<RuntimeCo
         save_config(&paths.config_path, &default)?;
     }
 
-    let config = load_config(&paths.config_path)?;
+    let mut config = load_config(&paths.config_path)?;
+    normalize_provider_defaults(&mut config);
     Ok(RuntimeConfig { config, paths })
 }
 
@@ -422,4 +423,36 @@ pub fn save_config(path: &Path, cfg: &AppConfig) -> Result<()> {
     let serialized = toml::to_string_pretty(cfg).context("serializing config")?;
     fs::write(path, serialized).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+fn normalize_provider_defaults(cfg: &mut AppConfig) {
+    let model = cfg.providers.gemini.default_model.trim();
+    let normalized = model.trim_start_matches("models/").trim();
+    let legacy_or_empty = normalized.is_empty() || normalized == "gemini-1.5-flash";
+    if legacy_or_empty {
+        cfg.providers.gemini.default_model = "gemini-2.5-flash".to_string();
+    } else if normalized != model {
+        cfg.providers.gemini.default_model = normalized.to_string();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_legacy_gemini_model() {
+        let mut cfg = AppConfig::default();
+        cfg.providers.gemini.default_model = "gemini-1.5-flash".to_string();
+        normalize_provider_defaults(&mut cfg);
+        assert_eq!(cfg.providers.gemini.default_model, "gemini-2.5-flash");
+    }
+
+    #[test]
+    fn strips_models_prefix_from_gemini_model() {
+        let mut cfg = AppConfig::default();
+        cfg.providers.gemini.default_model = "models/gemini-2.5-flash".to_string();
+        normalize_provider_defaults(&mut cfg);
+        assert_eq!(cfg.providers.gemini.default_model, "gemini-2.5-flash");
+    }
 }
